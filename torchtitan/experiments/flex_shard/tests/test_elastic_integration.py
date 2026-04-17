@@ -757,3 +757,242 @@ def test_T12_2_backward_training_continues_nccl():
     for r in results:
         assert r["report_new_ws"] == min_replicas_after
         assert r["report_dropped"] == ranks_to_remove
+
+
+# ---------------------------------------------------------------------------
+# T12.3 — Loss invariance across shrink (no backward in between)
+# ---------------------------------------------------------------------------
+
+
+def _loss_invariance_worker(
+    rank: int,
+    world_size: int,
+    lighthouse_addr: str,
+    gloo_store_host: str,
+    gloo_store_port: int,
+    manager_port_base: int,
+    ranks_to_remove: list[int],
+    nccl_iface: str,
+) -> dict[str, Any]:
+    """Compute loss on ``world_size`` ranks for a fixed batch, shrink, then
+    compute loss again on the same batch on the survivors — with no
+    optimizer.step or parameter mutation in between. Returns both losses.
+
+    Since the full weights are unchanged across the shrink and the input
+    batch is identical, the two losses must match bit-exactly on every
+    survivor.
+    """
+    os.environ["NCCL_SOCKET_IFNAME"] = nccl_iface
+    os.environ["GLOO_SOCKET_IFNAME"] = nccl_iface
+
+    import torch
+    import torch.distributed as dist
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from torch.distributed.device_mesh import DeviceMesh
+    from torchft.manager import Manager
+    from torchft.process_group import ProcessGroupNCCL
+
+    from torchtitan.experiments.flex_shard import (
+        flex_shard,
+        per_param_placements,
+    )
+    from torchtitan.experiments.flex_shard.elastic import shrink_flex_shard
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+
+    os.environ["MASTER_ADDR"] = gloo_store_host
+    os.environ["MASTER_PORT"] = str(gloo_store_port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    dist.init_process_group(
+        backend="gloo", rank=rank, world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+
+    ft_pg = ProcessGroupNCCL(timeout=timedelta(seconds=30))
+    ft_pg.register(f"loss_inv_{rank}")
+    store = dist.TCPStore(
+        host_name="localhost", port=0, is_master=True,
+        wait_for_workers=False,
+    )
+    manager = Manager(
+        pg=ft_pg, load_state_dict=None, state_dict=None,
+        min_replica_size=world_size - len(ranks_to_remove),
+        use_async_quorum=False,
+        replica_id=str(rank), store_addr="localhost", store_port=store.port,
+        rank=0, world_size=1, lighthouse_addr=lighthouse_addr,
+        port=manager_port_base + rank, timeout=timedelta(seconds=30),
+        quorum_timeout=timedelta(seconds=30),
+    )
+
+    try:
+        manager.start_quorum(allow_heal=False)
+        torch.cuda.synchronize()
+
+        mesh = DeviceMesh(
+            "cuda",
+            torch.tensor(list(range(world_size)), dtype=torch.int),
+            _init_backend=False,
+        )
+        mesh._dim_group_names = [ft_pg.group_name]
+        _my = rank
+
+        def _gl(mesh_dim=None, _r=_my):
+            return _r
+
+        mesh.get_local_rank = _gl
+
+        torch.manual_seed(42)
+
+        class Tiny(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fc1 = nn.Linear(64, 100, bias=True)
+                self.fc2 = nn.Linear(100, 32, bias=True)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.fc2(torch.relu(self.fc1(x)))
+
+        model = Tiny().to(device)
+        flex_shard(model, mesh, per_param_placements, reshard_after_forward=True)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+        # Deterministic batch; same seed on every rank so every rank
+        # computes the same loss on both sides of the shrink.
+        g_x = torch.Generator(device=device).manual_seed(7)
+        g_y = torch.Generator().manual_seed(7)
+        x = torch.randn(8, 64, device=device, generator=g_x)
+        y = torch.randint(0, 32, (8,), generator=g_y).to(device)
+
+        with torch.no_grad():
+            logits_pre = model(x)
+            loss_pre = F.cross_entropy(logits_pre, y).detach()
+        torch.cuda.synchronize()
+        loss_pre_val = float(loss_pre.cpu())
+
+        # Shrink. No parameter changes, no backward.
+        new_mesh, _report = shrink_flex_shard(
+            model, optimizer, ranks_to_remove, manager=manager,
+            timeout=timedelta(seconds=60),
+        )
+        torch.cuda.synchronize()
+
+        if new_mesh is None:
+            return {
+                "rank": rank, "departing": True,
+                "loss_pre": loss_pre_val,
+            }
+
+        with torch.no_grad():
+            logits_post = model(x)
+            loss_post = F.cross_entropy(logits_post, y).detach()
+        torch.cuda.synchronize()
+
+        return {
+            "rank": rank, "departing": False,
+            "loss_pre": loss_pre_val,
+            "loss_post": float(loss_post.cpu()),
+            "logits_pre": logits_pre.detach().cpu(),
+            "logits_post": logits_post.detach().cpu(),
+        }
+    finally:
+        try:
+            manager.shutdown(wait=False)
+        except Exception:
+            pass
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 4,
+    reason="Tier 12 requires >= 4 CUDA devices",
+)
+def test_T12_3_loss_invariant_across_shrink_no_backward():
+    """Loss on 4 ranks == loss on 3 ranks for the same batch and weights.
+
+    With no backward / optimizer.step between the two measurements, the
+    model's full weights are unchanged across the shrink. Running the same
+    input through the post-shrink model must therefore produce the same
+    logits (bit-exact) and the same cross-entropy loss.
+
+    This is the "sharding-invariance of forward" contract at the loss
+    level, complementing T12.1 which checks it at the output-tensor level.
+    """
+    from torchft._torchft import LighthouseServer
+
+    world_size = 4
+    ranks_to_remove = [2]
+    min_replicas_after = world_size - len(ranks_to_remove)
+
+    env_iface = os.environ.get("NCCL_SOCKET_IFNAME")
+    available = {name for _, name in socket.if_nameindex()}
+    if env_iface and env_iface in available:
+        nccl_iface = env_iface
+    else:
+        nccl_iface = _detect_iface()
+
+    lighthouse = LighthouseServer(bind="[::]:0", min_replicas=min_replicas_after)
+    try:
+        gloo_store_port = _pick_free_port()
+        manager_port_base = _pick_free_port()
+
+        context = python_mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=world_size, mp_context=context) as ex:
+            futures = [
+                ex.submit(
+                    _loss_invariance_worker,
+                    rank, world_size, lighthouse.address(),
+                    "localhost", gloo_store_port, manager_port_base,
+                    ranks_to_remove, nccl_iface,
+                )
+                for rank in range(world_size)
+            ]
+            results = [f.result(timeout=180) for f in futures]
+    finally:
+        lighthouse.shutdown()
+
+    survivors = [r for r in results if not r["departing"]]
+    departing = [r for r in results if r["departing"]]
+    assert len(survivors) == min_replicas_after
+    assert len(departing) == len(ranks_to_remove)
+
+    # Every survivor: loss_pre == loss_post bit-exact. The weights didn't
+    # move, the input is identical.
+    for r in survivors:
+        torch.testing.assert_close(
+            torch.tensor(r["loss_pre"]), torch.tensor(r["loss_post"]),
+            rtol=0, atol=0,
+            msg=lambda m, rank=r["rank"]: (
+                f"rank {rank}: loss_pre={r['loss_pre']} != "
+                f"loss_post={r['loss_post']} (weights didn't change, "
+                f"input didn't change — loss must be identical)\n{m}"
+            ),
+        )
+        torch.testing.assert_close(
+            r["logits_pre"], r["logits_post"], rtol=0, atol=0,
+            msg=lambda m, rank=r["rank"]: (
+                f"rank {rank}: logits changed across shrink with no "
+                f"backward — sharding layout change must preserve forward "
+                f"output bit-exactly\n{m}"
+            ),
+        )
+
+    # All survivors agree on the loss (data-parallel consistency).
+    ref_loss = survivors[0]["loss_post"]
+    for other in survivors[1:]:
+        assert other["loss_post"] == ref_loss, (
+            f"rank {other['rank']} disagrees with rank {survivors[0]['rank']} "
+            f"on post-shrink loss: {other['loss_post']} vs {ref_loss}"
+        )
+
+    # Departing rank's pre-shrink loss should match the survivors' pre-shrink
+    # loss (same data-parallel state pre-shrink).
+    for d in departing:
+        assert d["loss_pre"] == survivors[0]["loss_pre"], (
+            f"departing rank {d['rank']} disagreed on pre-shrink loss: "
+            f"{d['loss_pre']} vs survivor {survivors[0]['rank']} "
+            f"{survivors[0]['loss_pre']}"
+        )
