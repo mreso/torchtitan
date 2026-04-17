@@ -280,14 +280,16 @@ class Shard(Placement):
         send_buf_2d = send_buf.view(ws, -1)
         torch._chunk_cat(tensors, dim=0, num_chunks=ws, out=send_buf_2d)
 
-        recv_buf = torch.empty(output_numel, dtype=dtype, device=device)
-
-        dist.reduce_scatter_tensor(
-            output=recv_buf,
-            input=send_buf,
-            op=dist.ReduceOp.AVG,
-            group=pg,
+        # Route through ``_c10d_functional`` rather than ``dist``. The
+        # ``dist.reduce_scatter_tensor`` dispatch resolves to the backend's
+        # ``_reduce_scatter_base`` entry point, which torchft's
+        # ``ProcessGroupWrapper`` (both gloo and NCCL) does not expose — it
+        # only implements ``reduce_scatter_tensor_coalesced``. The functional
+        # op goes through the coalesced-list path that torchft does forward.
+        recv_buf = torch.ops._c10d_functional.reduce_scatter_tensor(
+            send_buf, "avg", ws, pg.group_name
         )
+        recv_buf = torch.ops._c10d_functional.wait_tensor(recv_buf)
 
         # Unpack per param from recv_buf
         results: list[torch.Tensor] = []
@@ -480,13 +482,12 @@ class FlatShard(Placement):
         else:
             send_buf = flat_grads
 
-        recv_buf = torch.empty(chunk, dtype=dtype, device=device)
-        dist.reduce_scatter_tensor(
-            output=recv_buf,
-            input=send_buf,
-            op=dist.ReduceOp.AVG,
-            group=pg,
+        # Functional op (see note in Shard.reduce_grad about torchft's
+        # ProcessGroupWrapper not routing ``_reduce_scatter_base``).
+        recv_buf = torch.ops._c10d_functional.reduce_scatter_tensor(
+            send_buf, "avg", ws, pg.group_name
         )
+        recv_buf = torch.ops._c10d_functional.wait_tensor(recv_buf)
 
         # Extract per-param sharded grads from recv_buf
         results: list[torch.Tensor] = []
@@ -1798,6 +1799,40 @@ class DStorage:
         typed_flat = byte_view.view(info.dtype)
         return typed_flat.view(info.global_shape)
 
+    def populate_unsharded_byte_storage(self) -> None:
+        """Allocate ``_unsharded_byte_storage`` and fill it via all-gather.
+
+        This is the byte-level subset of :meth:`unshard` — it does NOT mutate
+        module attributes. Callers that only need the full tensor in
+        ``_unsharded_byte_storage`` (e.g. elastic shrink's Phase B in
+        parametrization mode, where the module's params are managed by
+        ``nn.utils.parametrize`` and cannot be replaced with plain Parameters)
+        should use this instead.
+
+        Idempotent on the state machine: does not transition between
+        SHARDED and UNSHARDED.
+        """
+        if self._unsharded_byte_storage is None:
+            self._unsharded_byte_storage = torch.empty(
+                self._total_unsharded_bytes,
+                dtype=torch.uint8,
+                device=self._byte_storage.device,
+            )
+
+        infos = list(self._param_infos.values())
+        ptype = type(infos[0].placements[0])
+        local_shards = [self._sharded_params[info.fqn].data for info in infos]
+
+        with record_function(f"populate_unsharded({self._module_fqn})"):
+            full_params = ptype.unshard(local_shards, infos, self._mesh)
+
+        for info, full_param in zip(infos, full_params):
+            num_bytes = info.global_numel * info.dtype.itemsize
+            dest = self._unsharded_byte_storage[
+                info.unsharded_byte_offset : info.unsharded_byte_offset + num_bytes
+            ]
+            dest.copy_(full_param.reshape(-1).view(torch.uint8))
+
     def unshard(self) -> None:
         """
         All-gather local shards and register unsharded parameters on the module.
@@ -1807,28 +1842,7 @@ class DStorage:
         if self._state == ShardedState.UNSHARDED:
             return  # Already unsharded
 
-        # Allocate unsharded buffer if needed
-        if self._unsharded_byte_storage is None:
-            self._unsharded_byte_storage = torch.empty(
-                self._total_unsharded_bytes,
-                dtype=torch.uint8,
-                device=self._byte_storage.device,
-            )
-
-        # Gather via Placement.unshard()
-        infos = list(self._param_infos.values())
-        ptype = type(infos[0].placements[0])
-        local_shards = [self._sharded_params[info.fqn].data for info in infos]
-
-        with record_function(f"unshard({self._module_fqn})"):
-            full_params = ptype.unshard(local_shards, infos, self._mesh)
-
-        for info, full_param in zip(infos, full_params):
-            num_bytes = info.global_numel * info.dtype.itemsize
-            dest = self._unsharded_byte_storage[
-                info.unsharded_byte_offset : info.unsharded_byte_offset + num_bytes
-            ]
-            dest.copy_(full_param.reshape(-1).view(torch.uint8))
+        self.populate_unsharded_byte_storage()
 
         # Register unsharded parameters on the module
         for fqn, info in self._param_infos.items():
@@ -2114,6 +2128,56 @@ class DStorage:
             self._post_forward_hook_handle.remove()
             self._post_forward_hook_handle = None
 
+    def replace_contents(
+        self,
+        byte_storage: torch.Tensor,
+        param_infos: dict[str, ParamInfo],
+        mesh: DeviceMesh,
+        total_bytes: int,
+        total_unsharded_bytes: int,
+    ) -> None:
+        """
+        Replace the backing storage, param infos, and mesh after an elastic
+        reshard. Rebuilds `_sharded_params` as fresh typed views into the new
+        byte buffer and re-attaches them on the owning modules.
+        """
+        if byte_storage.dtype != torch.uint8:
+            raise ValueError(f"Expected uint8 storage, got {byte_storage.dtype}")
+        self._byte_storage = byte_storage
+        self._param_infos = param_infos
+        self._mesh = mesh
+        self._total_bytes = total_bytes
+        self._total_unsharded_bytes = total_unsharded_bytes
+        self._unsharded_byte_storage = None
+        self._state = ShardedState.SHARDED
+
+        self._sharded_params = {}
+        for fqn, info in param_infos.items():
+            num_bytes = info.local_numel * info.dtype.itemsize
+            local_view = byte_storage[info.byte_offset : info.byte_offset + num_bytes]
+            typed_view = local_view.view(info.dtype).view(info.local_shape)
+            new_param = nn.Parameter(typed_view, requires_grad=info.requires_grad)
+            _create_sharded_view(new_param, info, mesh)
+            self._sharded_params[fqn] = new_param
+            # Walk through CheckpointWrapper if reshard-after-forward wrapped
+            # the owning module — the original Linear (holding _parameters)
+            # lives at ``_checkpoint_wrapped_module``.
+            parts = fqn.split(".")
+            leaf = self._module
+            for part in parts[:-1]:
+                child = getattr(leaf, part, None)
+                if child is None:
+                    wrapped = getattr(leaf, "_checkpoint_wrapped_module", None)
+                    if wrapped is not None:
+                        leaf = getattr(wrapped, part)
+                    else:
+                        leaf = getattr(leaf, part)
+                else:
+                    leaf = child
+            if hasattr(leaf, "_checkpoint_wrapped_module"):
+                leaf = leaf._checkpoint_wrapped_module
+            leaf._parameters[parts[-1]] = new_param
+
 
 def _compute_local_info(
     global_shape: torch.Size,
@@ -2179,27 +2243,39 @@ def auto_buckets(module: nn.Module) -> list[list[str]]:
     return [[f"{name}.*"] for name, _ in children]
 
 
-def _create_param_infos(
+def _build_param_infos(
     named_params: list[tuple[str, nn.Parameter]],
     mesh: DeviceMesh,
     param_placements: dict[str, tuple[Placement, ...]],
+    *,
+    rank: int | None = None,
+    world_size: int | None = None,
 ) -> tuple[dict[str, ParamInfo], int, int]:
     """
-    Create ParamInfo for each parameter, computing local shapes and byte offsets.
+    Build ParamInfo for each parameter, computing local shapes and byte offsets.
 
     Placement-agnostic: works with any placement type (Shard, FlatShard, Owned, etc.).
     Parameters are laid out sequentially in the byte buffer with proper alignment.
+
+    ``rank`` and ``world_size`` default to the mesh's current values. Callers
+    that are computing a future layout — e.g. ``FlexShardHandle.reshard``
+    projecting to an N-1 group before the mesh is rebuilt — override these.
 
     Args:
         named_params: List of (fqn, param) tuples
         mesh: Device mesh for sharding
         param_placements: Dict mapping FQN to placement tuple for each parameter
+        rank: Override local rank (default: ``mesh.get_local_rank()``)
+        world_size: Override world size (default: ``mesh.size()``)
 
     Returns:
         param_infos: dict mapping FQN to ParamInfo
         total_bytes: total bytes needed for the sharded buffer
         total_unsharded_bytes: total bytes needed for the unsharded buffer
     """
+    effective_rank = mesh.get_local_rank() if rank is None else rank
+    effective_ws = mesh.size() if world_size is None else world_size
+
     param_infos: dict[str, ParamInfo] = {}
     current_byte_offset = 0
     current_unsharded_byte_offset = 0
@@ -2219,7 +2295,13 @@ def _create_param_infos(
             pass
         global_shape = param_for_shape.shape
         global_stride = make_contiguous_strides_for(global_shape)
-        local_shape, local_numel = _compute_local_info(global_shape, mesh, placements)
+        placement = placements[0]
+        local_shape = placement.compute_local_shape(
+            global_shape, effective_rank, effective_ws
+        )
+        local_numel = placement.compute_local_numel(
+            global_shape, effective_rank, effective_ws
+        )
         dtype = param.dtype
         global_numel = param_for_shape.numel()
 
@@ -2616,7 +2698,7 @@ def flex_shard(
         bucket_named_params = [(fqn, named_params_dict[fqn]) for fqn in bucket_fqns]
         bucket_placements = {fqn: param_placements[fqn] for fqn in bucket_fqns}
 
-        param_infos, total_bytes, total_unsharded_bytes = _create_param_infos(
+        param_infos, total_bytes, total_unsharded_bytes = _build_param_infos(
             bucket_named_params, mesh, bucket_placements
         )
 
@@ -2666,6 +2748,7 @@ def flex_shard(
     if not issubclass(cls, FlexShardModule):
         module.__class__ = type(cls.__name__, (cls, FlexShardModule), {})
 
+    hook_handles: list["RemovableHandle"] = []
     # Register property-based parametrization (Phase 2a)
     if not register_hooks:
         group_name = mesh.get_group().group_name
@@ -2711,6 +2794,11 @@ def flex_shard(
                 if leaf_mod not in module_param_map:
                     module_param_map[leaf_mod] = {}
                 module_param_map[leaf_mod][local_name] = p
+                # Also record the fqn alongside the parametrization so the
+                # elastic-reshard path can look up the per-param info
+                # directly. Stashed on ``p`` (not a side dict) so it lives
+                # exactly as long as the parametrization does.
+                p._flex_shard_fqn = fqn
 
         for mod, param_map in module_param_map.items():
             _register_parametrization(mod, param_map)
@@ -2730,7 +2818,20 @@ def flex_shard(
         # The property getter still calls parametrization.forward(), which
         # detects _pre_gathered and uses a detached leaf instead of
         # issuing its own _c10d_functional.all_gather_into_tensor.
-        _install_batched_allgather_hooks(storages, module_param_map)
+        hook_handles = _install_batched_allgather_hooks(storages, module_param_map)
+    else:
+        module_param_map = {}
+
+    # Expose state needed for elastic re-sharding. The handle is the sole
+    # public entrypoint for mutating FlexShard state at runtime — see
+    # ``torchtitan/experiments/flex_shard/elastic.py``.
+    module._flex_shard_handle = FlexShardHandle._build(
+        root=module,
+        storages=storages,
+        module_param_map=module_param_map,
+        hook_handles=hook_handles,
+        register_hooks_mode=register_hooks,
+    )
 
     return module
 
@@ -2795,7 +2896,7 @@ def _apply_reshard_checkpoint(module: nn.Module) -> None:
 def _install_batched_allgather_hooks(
     storages: list,
     module_param_map: dict[nn.Module, dict[str, nn.Module]],
-) -> None:
+) -> list["RemovableHandle"]:
     """Install pre/post forward hooks for batched per-bucket all-gather.
 
     In eager mode, each DStorage's pre-forward hook runs a single batched
@@ -2805,7 +2906,13 @@ def _install_batched_allgather_hooks(
 
     Skipped under torch.compile — compiled modes use per-param
     _c10d_functional ops which the compiler rebatches via graph passes.
+
+    Returns the list of ``RemovableHandle``s for every pre/post hook
+    installed. Callers (e.g. ``FlexShardHandle``) remove and re-install
+    these hooks when the mesh is re-sharded, since each hook closes over
+    stale ``ParamInfo`` / ``entries`` lists.
     """
+    installed: list["RemovableHandle"] = []
 
     for storage in storages:
         infos = list(storage._param_infos.values())
@@ -2932,8 +3039,10 @@ def _install_batched_allgather_hooks(
         # Navigate through CheckpointWrapper to the inner module.
         target = _get_bucket_module(storage)
         inner = getattr(target, "_checkpoint_wrapped_module", target)
-        inner.register_forward_pre_hook(pre_hook)
-        inner.register_forward_hook(post_hook)
+        installed.append(inner.register_forward_pre_hook(pre_hook))
+        installed.append(inner.register_forward_hook(post_hook))
+
+    return installed
 
 
 def _get_bucket_module(storage) -> nn.Module:
@@ -2967,3 +3076,297 @@ def _get_bucket_module(storage) -> nn.Module:
     for part in common.split("."):
         mod = getattr(mod, part)
     return mod
+
+
+# ---------------------------------------------------------------------------
+# FlexShardHandle — runtime state for elastic shrink
+# ---------------------------------------------------------------------------
+
+
+class FlexShardHandle:
+    """Per-model runtime handle for FlexShard internals.
+
+    Installed on every model passed through ``flex_shard()`` as
+    ``model._flex_shard_handle``. Carries references to the DStorages, the
+    ``module_param_map`` (leaf module -> {local_name -> parametrization}),
+    and the list of forward-hook ``RemovableHandle``s so that
+    ``elastic.shrink_flex_shard()`` can re-shard weights in place without
+    re-running ``flex_shard()``.
+
+    Construct via ``FlexShardHandle._build(...)``; callers should not
+    instantiate directly.
+    """
+
+    def __init__(self) -> None:
+        # Weakref to the root module. Using a weakref avoids a cycle
+        # (handle is stored on the module, so a strong ref would prevent
+        # garbage collection of the whole model).
+        import weakref
+
+        self._root_ref: "weakref.ReferenceType[nn.Module] | None" = None
+
+        self.dstorages: list[DStorage] = []
+
+        # leaf module -> {local_param_name -> parametrization nn.Module}
+        self.module_param_map: dict[nn.Module, dict[str, nn.Module]] = {}
+
+        # Forward pre/post hook handles installed by
+        # ``_install_batched_allgather_hooks``. Elastic reshard removes and
+        # re-installs these because each hook closes over a ``param_entries``
+        # list with stale ParamInfos after re-sharding.
+        self.hook_handles: list["RemovableHandle"] = []
+
+        # fqn -> live sharded nn.Parameter. Refreshed after every reshard so
+        # optimizer-state migration (in elastic.py) can map old-param ->
+        # fqn -> new-param in O(1).
+        self.current_param_from_fqn: dict[str, nn.Parameter] = {}
+
+        # Populated only during an active reshard: id(old_param) -> fqn.
+        # Elastic.py uses this to rekey ``optimizer.state`` after weights
+        # are replaced.
+        self.fqn_from_old_param: dict[int, str] = {}
+
+        # True if flex_shard was called with register_hooks=True (hooks
+        # mode). Elastic shrink currently only supports parametrization
+        # mode, so the elastic entry point checks this and raises.
+        self.register_hooks_mode: bool = False
+
+    @classmethod
+    def _build(
+        cls,
+        root: nn.Module,
+        storages: list[DStorage],
+        module_param_map: dict[nn.Module, dict[str, nn.Module]],
+        hook_handles: list["RemovableHandle"],
+        register_hooks_mode: bool,
+    ) -> "FlexShardHandle":
+        """Construct a handle from the final state of ``flex_shard()``.
+
+        This is the only intended entry point; it walks the DStorages to
+        populate ``current_param_from_fqn``.
+        """
+        import weakref
+
+        handle = cls()
+        handle._root_ref = weakref.ref(root)
+        handle.dstorages = storages
+        handle.module_param_map = module_param_map
+        handle.hook_handles = hook_handles
+        handle.register_hooks_mode = register_hooks_mode
+        handle.current_param_from_fqn = {}
+        for storage in storages:
+            for fqn in storage._param_infos:
+                # Walk to the leaf, respecting CheckpointWrapper which may
+                # have replaced a parent module after flex_shard's param
+                # installation. ``storage._sharded_params`` was populated
+                # against the pre-wrap tree, so we prefer it as the source
+                # of truth when present.
+                if fqn in storage._sharded_params:
+                    handle.current_param_from_fqn[fqn] = storage._sharded_params[fqn]
+                    continue
+                parts = fqn.split(".")
+                leaf = root
+                for part in parts[:-1]:
+                    child = getattr(leaf, part, None)
+                    if child is None and hasattr(leaf, "_checkpoint_wrapped_module"):
+                        child = getattr(leaf._checkpoint_wrapped_module, part)
+                    leaf = child
+                if hasattr(leaf, "_checkpoint_wrapped_module"):
+                    leaf = leaf._checkpoint_wrapped_module
+                handle.current_param_from_fqn[fqn] = leaf._parameters[parts[-1]]
+        return handle
+
+    def root(self) -> "nn.Module | None":
+        """Return the root module, or None if it has been garbage-collected."""
+        if self._root_ref is None:
+            return None
+        return self._root_ref()
+
+    def reshard(self, new_mesh: DeviceMesh) -> None:
+        """Re-shard every DStorage in place onto ``new_mesh``.
+
+        Prerequisite: each DStorage's ``_unsharded_byte_storage`` has been
+        populated (``DStorage.unshard()`` on the old mesh). This method
+        rebuilds ParamInfos for ``new_mesh``'s (rank, ws), allocates fresh
+        sharded byte storage, slices the new shard out of the unsharded
+        buffer, swaps the state via ``DStorage.replace_contents``, mutates
+        parametrization fields to the new world_size, and re-installs the
+        batched all-gather hooks (the old closures captured stale infos).
+
+        Raises ``NotImplementedError`` in hooks mode (v1 scope, per plan).
+        """
+        if self.register_hooks_mode:
+            raise NotImplementedError(
+                "FlexShardHandle.reshard requires parametrization mode "
+                "(register_hooks=False)"
+            )
+
+        new_rank = new_mesh.get_local_rank()
+        new_ws = new_mesh.size()
+
+        self.fqn_from_old_param = {}
+
+        for storage in self.dstorages:
+            if storage._unsharded_byte_storage is None:
+                raise RuntimeError(
+                    f"DStorage {storage._module_fqn} has no "
+                    f"_unsharded_byte_storage; call DStorage.unshard() before "
+                    f"FlexShardHandle.reshard()"
+                )
+            for fqn, old_param in storage._sharded_params.items():
+                self.fqn_from_old_param[id(old_param)] = fqn
+
+            old_infos = storage._param_infos
+            # FlatShard degenerate path: a param with numel < new_ws cannot
+            # occupy every rank under the ceil-divide layout; at least one
+            # rank will hold an empty slice. Warn so users can rethink bucket
+            # sizing (see plan "Scope / Edge cases").
+            for fqn, info in old_infos.items():
+                placement = info.placements[0]
+                if isinstance(placement, FlatShard):
+                    if placement.total_flat_numel < new_ws:
+                        import warnings
+
+                        warnings.warn(
+                            f"flat_numel < new_ws for {fqn!r}: "
+                            f"total_flat_numel={placement.total_flat_numel} "
+                            f"< new_ws={new_ws}; some ranks will hold empty "
+                            f"shards",
+                            UserWarning,
+                            stacklevel=2,
+                        )
+            # Re-run the ParamInfo builder for the new layout. The builder
+            # reads .shape / .dtype / .numel off each "param"; a stand-in
+            # tensor shaped like ``info.global_shape`` is enough.
+            fake_named_params: list[tuple[str, torch.Tensor]] = []
+            placements: dict[str, tuple[Placement, ...]] = {}
+            for fqn, info in old_infos.items():
+                stand_in = torch.empty(
+                    info.global_shape,
+                    dtype=info.dtype,
+                    device="meta",
+                )
+                if info.requires_grad:
+                    stand_in.requires_grad_(True)
+                fake_named_params.append((fqn, stand_in))
+                placements[fqn] = info.placements
+
+            new_infos, new_total_bytes, new_total_unsharded_bytes = (
+                _build_param_infos(
+                    fake_named_params,
+                    new_mesh,
+                    placements,
+                    rank=new_rank,
+                    world_size=new_ws,
+                )
+            )
+
+            old_storage = storage._byte_storage
+            pinned = False
+            if old_storage.device.type == "cpu":
+                try:
+                    pinned = old_storage.is_pinned()
+                except Exception:
+                    pinned = False
+            if pinned:
+                new_byte_storage = torch.empty(
+                    new_total_bytes,
+                    dtype=torch.uint8,
+                    device="cpu",
+                    pin_memory=True,
+                )
+            else:
+                new_byte_storage = torch.empty(
+                    new_total_bytes,
+                    dtype=torch.uint8,
+                    device=old_storage.device,
+                )
+
+            for fqn, new_info in new_infos.items():
+                if new_info.local_numel == 0:
+                    continue
+                full = storage.get_unsharded_view(fqn)
+                placement = new_info.placements[0]
+                new_shard = placement.extract_local_shard(full, new_rank, new_ws)
+                nbytes = new_info.local_numel * new_info.dtype.itemsize
+                dest = new_byte_storage[
+                    new_info.byte_offset : new_info.byte_offset + nbytes
+                ]
+                dest.copy_(
+                    new_shard.to(new_info.dtype).contiguous().reshape(-1).view(torch.uint8)
+                )
+
+            storage.replace_contents(
+                new_byte_storage,
+                new_infos,
+                new_mesh,
+                new_total_bytes,
+                new_total_unsharded_bytes,
+            )
+
+        # Mutate parametrization fields for the new world_size. The
+        # ``group_name`` is preserved by ``ProcessGroupWrapper.configure``
+        # (which the caller in elastic.py runs) so we only touch world_size
+        # and uneven-split bookkeeping.
+        fqn_to_info: dict[str, ParamInfo] = {}
+        for storage in self.dstorages:
+            for fqn, info in storage._param_infos.items():
+                fqn_to_info[fqn] = info
+
+        for _leaf_mod, pmap in self.module_param_map.items():
+            for _local_name, p in pmap.items():
+                target = p
+                if isinstance(target, DTensorAwareParametrization):
+                    target = target.inner
+                fqn = getattr(p, "_flex_shard_fqn", None)
+                if fqn is None:
+                    continue
+                info = fqn_to_info.get(fqn)
+                if info is None:
+                    continue
+
+                if isinstance(target, ShardParametrization):
+                    dim_size = info.global_shape[target.shard_dim]
+                    uneven = dim_size % new_ws != 0
+                    target.world_size = new_ws
+                    target.padded_shard_size = (
+                        (dim_size + new_ws - 1) // new_ws if uneven else None
+                    )
+                    target.global_dim_size = dim_size if uneven else None
+                elif isinstance(target, FlatShardParametrization):
+                    numel = info.global_numel
+                    uneven = numel % new_ws != 0
+                    target.world_size = new_ws
+                    target.padded_shard_size = (
+                        (numel + new_ws - 1) // new_ws if uneven else None
+                    )
+                    target.global_numel = numel if uneven else None
+                else:
+                    # Owned / RaggedShard would need per-type uneven-split
+                    # bookkeeping; silently touching ``world_size`` alone
+                    # would leave padded/global fields stale and corrupt the
+                    # next all-gather. v1 hard-stops instead.
+                    raise NotImplementedError(
+                        f"FlexShardHandle.reshard: parametrization "
+                        f"{type(target).__name__} is out of scope for v1 "
+                        f"(Shard and FlatShard only). fqn={fqn!r}"
+                    )
+
+        # Refresh batched all-gather hooks. The old closures captured
+        # ``param_entries`` built from pre-reshard ParamInfos / sharded
+        # params; those are now stale. Remove the old handles and
+        # re-install from the refreshed DStorages + module_param_map.
+        for h in self.hook_handles:
+            try:
+                h.remove()
+            except Exception:  # noqa: BLE001
+                pass
+        self.hook_handles = _install_batched_allgather_hooks(
+            self.dstorages, self.module_param_map
+        )
+
+        # Refresh the live sharded-param mapping.
+        self.current_param_from_fqn = {}
+        for storage in self.dstorages:
+            for fqn, sp in storage._sharded_params.items():
+                self.current_param_from_fqn[fqn] = sp

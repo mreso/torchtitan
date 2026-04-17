@@ -259,6 +259,43 @@ By focusing on placement and metadata as the shared abstraction, FlexShard minim
 4. **Upstream to PyTorch**: Move core components (`Placement`, `DStorage`) from `torchtitan/experiments/` into `torch.distributed` once the API stabilizes.
 5. **Convergence testing**: Validate loss convergence on representative workloads (e.g., Llama on C4) across all placement types and parallelism configurations.
 
+## Elastic Shrink
+
+`elastic.py` exposes `shrink_flex_shard(model, optimizer, ranks_to_remove, *, manager, timeout=...)` — drop a chosen set of ranks from the FlexShard data-parallel group and continue training with the survivors. Requires `flex_shard()` to have been called with `register_hooks=False` (parametrization mode) and the PG to be a `torchft.ProcessGroupWrapper`.
+
+### Handle
+
+`flex_shard()` stores a `FlexShardHandle` on `model._flex_shard_handle`. It carries the DStorages, the parametrization module map, the batched all-gather hook handles, and an `fqn`-keyed view of the current sharded parameters. `handle.reshard(new_mesh)` is the single entry point for in-place re-sharding — `elastic.py` delegates all mutation of DStorage internals and parametrization fields to it. `DStorage.replace_contents(...)` is the one new DStorage method the handle calls.
+
+### Coordination contract
+
+Every rank in the current group (including the departing ones) must call `shrink_flex_shard` collectively. Survivors receive `(new_mesh, ShrinkReport)`; each departing rank receives `(None, ShrinkReport)` after participating in the unshard all-gathers and signaling shutdown to the Lighthouse. `ranks_to_remove` must match on every caller — a hash all-gather on entry catches divergence.
+
+Phase layout:
+
+- **A** Entry validation + divergence check.
+- **B** Unshard weights and optimizer moments onto every rank (collective — all N ranks).
+- **C** Survivors only: `manager.start_quorum(allow_heal=False, shrink_only=True, ...)` (reconfigures the PG internally), then rebuild the `DeviceMesh` manually (`DeviceMesh.from_group` rejects torchft's world-size-1 wrapper registration).
+- **D** Survivors: `handle.reshard(new_mesh)` — allocate new byte storage, re-slice, rebuild sharded parameters, re-attach on modules, mutate parametrization fields (`world_size`, `padded_shard_size`, `global_dim_size`), reinstall batched hooks.
+- **E** Survivors: re-shard Adam moments and rekey `optimizer.state` / `param_groups`.
+
+### Memory peak
+
+Per-rank peak during the largest bucket's Phase B+D, for Adam-style state:
+
+```
+peak ≈ U/N_old           (pre-existing shards across all buckets)
+     + U/(N_new)         (new shards, accumulating across buckets in Phase D)
+     + B                 (full weights for the active bucket)
+     + 2 * B             (full exp_avg + exp_avg_sq for the active bucket)
+```
+
+If the whole model is one bucket (`B = U`), peak ≈ `U * (1/N_old + 1/N_new + 3)` ≈ `4U`. **Mitigation:** define multiple `BucketSpec`s at `flex_shard()` time so `B` is small relative to `U`. Bucket sizing directly controls the shrink memory envelope.
+
+### Scope (v1)
+
+Supported: `Shard(dim)`, `FlatShard`, parametrization mode, Adam-style optimizer state, mixed precision, CPU offload, DTensor/TP composition, successive shrinks (4→3→2...). Not supported (raises `NotImplementedError`): hooks mode (`register_hooks=True`), `fused=True` / `capturable=True` optimizers, group *growth*.
+
 ## References
 
 - [PyTorch FSDP2 Design](https://github.com/pytorch/pytorch/tree/main/torch/distributed/fsdp)
