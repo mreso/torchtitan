@@ -119,10 +119,11 @@ def _prepare_cifar10(data_root: str) -> None:
 
 
 def _load_cifar10_tensors(data_root: str, train: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return (images_fp32_normalized, labels_int64) for the requested split.
+    """Return (images_fp32_normalized_NCHW, labels_int64) for the requested split.
 
-    Images are [N, 3*32*32] flattened to feed an MLP, normalized per channel
-    (per CIFAR-10 convention).
+    Images are [N, 3, 32, 32] NCHW, normalized per channel (standard
+    CIFAR-10 mean/std). The MLP flattens internally; the CNN consumes
+    NCHW directly.
     """
     import torchvision
 
@@ -132,8 +133,7 @@ def _load_cifar10_tensors(data_root: str, train: bool = True) -> tuple[torch.Ten
     images = images.permute(0, 3, 1, 2).contiguous()
     mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1)
     std = torch.tensor([0.2470, 0.2435, 0.2616]).view(1, 3, 1, 1)
-    images = (images - mean) / std
-    images = images.reshape(images.size(0), -1).contiguous()  # [N, 3072]
+    images = ((images - mean) / std).contiguous()  # [N, 3, 32, 32]
     labels = torch.tensor(ds.targets, dtype=torch.int64)
     return images, labels
 
@@ -150,12 +150,70 @@ def _build_mlp() -> torch.nn.Module:
     import torch.nn as nn
 
     return nn.Sequential(
+        nn.Flatten(),
         nn.Linear(3072, 512),
         nn.ReLU(),
         nn.Linear(512, 256),
         nn.ReLU(),
         nn.Linear(256, 10),
     )
+
+
+class _SmallCNN(torch.nn.Module):
+    """Compact conv net: three 3x3 conv blocks + GroupNorm + global pool + FC.
+
+    Why GroupNorm instead of BatchNorm: BN maintains running mean / var as
+    non-parameter buffers that need per-step cross-rank sync and a defined
+    post-shrink state. FlexShard's parametrization currently only reshards
+    nn.Parameter tensors, not buffers — running stats would go stale after
+    a shrink. GroupNorm (num_groups=8) has no running stats; it's a pure
+    function of the mini-batch, so DP reduction of activation gradients
+    gives identical results before and after a shrink.
+
+    Channel counts are multiples of 8 so both Shard(0) and the GroupNorm
+    grouping divide cleanly at every world size in 1..4.
+    """
+
+    def __init__(self) -> None:
+        import torch.nn as nn
+
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, 64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, 64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # 32 -> 16
+
+            nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, 128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, 128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # 16 -> 8
+
+            nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, 256),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),   # [N, 256, 1, 1]
+        )
+        self.classifier = nn.Linear(256, 10)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.features(x)
+        h = h.flatten(1)
+        return self.classifier(h)
+
+
+def _build_model(name: str) -> torch.nn.Module:
+    if name == "mlp":
+        return _build_mlp()
+    if name == "cnn":
+        return _SmallCNN()
+    raise ValueError(f"unknown model name {name!r}; expected 'mlp' or 'cnn'")
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +288,7 @@ def _worker(
     eval_every: int,
     batch_size: int,
     lr: float,
+    model_name: str,
 ) -> dict[str, Any]:
     os.environ["NCCL_SOCKET_IFNAME"] = nccl_iface
     os.environ["GLOO_SOCKET_IFNAME"] = nccl_iface
@@ -299,7 +358,7 @@ def _worker(
         mesh.get_local_rank = _make_get_local_rank(rank)
 
         torch.manual_seed(42)
-        model = _build_mlp().to(device)
+        model = _build_model(model_name).to(device)
         flex_shard(model, mesh, per_param_placements, reshard_after_forward=True)
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -433,6 +492,7 @@ def run(
     batch_size: int = 64,
     lr: float = 1e-3,
     worker_timeout: int = 900,
+    model_name: str = "mlp",
 ) -> list[dict]:
     from torchft._torchft import LighthouseServer
 
@@ -464,6 +524,7 @@ def run(
                     "localhost", gloo_store_port, manager_port_base,
                     nccl_iface, data_root, out_dir,
                     total_steps, shrink_schedule, eval_every, batch_size, lr,
+                    model_name,
                 )
                 for rank in range(INITIAL_WORLD_SIZE)
             ]
@@ -723,6 +784,108 @@ def test_cifar10_elastic_converges_across_shrinks(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# CNN convergence run: demonstrate higher accuracy preserved across shrinks
+# ---------------------------------------------------------------------------
+#
+# The MLP ceiling on raw-pixel CIFAR-10 is ~55% even with unlimited training.
+# Swap in a small CNN (3 conv blocks + GroupNorm + global pool + FC head)
+# to reach 75%+ without augmentation or LR scheduling. Same shrink schedule;
+# only the model and step count change.
+
+
+CNN_TOTAL_STEPS = 6000
+CNN_SHRINK_SCHEDULE: list[tuple[int, list[int]]] = [
+    (2000, [3]),   # 4 -> 3
+    (3500, [2]),   # 3 -> 2
+    (5000, [1]),   # 2 -> 1
+]
+CNN_EVAL_EVERY = 500
+CNN_BATCH_SIZE = 128
+CNN_LR = 1e-3
+CNN_MIN_ACCURACY = 0.65      # random is 10%; small CNN reaches 75%+
+CNN_WORKER_TIMEOUT = 2400
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < INITIAL_WORLD_SIZE,
+    reason=f"needs >= {INITIAL_WORLD_SIZE} CUDA devices",
+)
+def test_cifar10_elastic_cnn_converges_across_shrinks(tmp_path):
+    """Convnet equivalent of the MLP long-run. Same shrink mechanics, higher
+    accuracy ceiling — makes the "learning is not impacted" claim visible
+    at meaningful (>65%) accuracy rather than the MLP's pixel-MLP ceiling.
+
+    Asserts the same invariants as the MLP run with a raised MIN_ACCURACY
+    floor (65%).
+    """
+    out_dir = tmp_path / "traces"
+    data_root = tmp_path / "cifar10"
+    results = run(
+        out_dir=out_dir, data_root=data_root,
+        total_steps=CNN_TOTAL_STEPS,
+        shrink_schedule=CNN_SHRINK_SCHEDULE,
+        eval_every=CNN_EVAL_EVERY,
+        batch_size=CNN_BATCH_SIZE,
+        lr=CNN_LR,
+        worker_timeout=CNN_WORKER_TIMEOUT,
+        model_name="cnn",
+    )
+
+    assert len(results) == INITIAL_WORLD_SIZE
+
+    rank_to_steps = {r["rank"]: r["num_steps"] for r in results}
+    expected = {
+        0: CNN_TOTAL_STEPS,
+        1: CNN_SHRINK_SCHEDULE[2][0],
+        2: CNN_SHRINK_SCHEDULE[1][0],
+        3: CNN_SHRINK_SCHEDULE[0][0],
+    }
+    for r, n in expected.items():
+        assert rank_to_steps[r] == n, (
+            f"rank {r} ran {rank_to_steps[r]} steps, expected {n}"
+        )
+
+    analysis = analyze(out_dir, shrink_schedule=CNN_SHRINK_SCHEDULE)
+    _print_report(results, analysis)
+
+    assert analysis["ok"], (
+        f"loss spiked across a shrink boundary: {analysis['per_shrink']}"
+    )
+
+    eval_trace = analysis["eval_trace"]
+    assert eval_trace, "no test-set eval points produced"
+    _final_step, _final_ws, final_acc, _final_xent = eval_trace[-1]
+    assert final_acc >= CNN_MIN_ACCURACY, (
+        f"final test accuracy {final_acc * 100:.2f}% below floor "
+        f"{CNN_MIN_ACCURACY * 100:.2f}%"
+    )
+
+    peak_acc = max(e[2] for e in eval_trace)
+    assert peak_acc >= CNN_MIN_ACCURACY + 0.05, (
+        f"peak test accuracy {peak_acc * 100:.2f}% not meaningfully above "
+        f"the MIN_ACCURACY floor {CNN_MIN_ACCURACY * 100:.2f}% — model "
+        f"never converged"
+    )
+
+    shrink_steps = [s for s, _ in CNN_SHRINK_SCHEDULE]
+    for shrink_step in shrink_steps:
+        before = [e for e in eval_trace if e[0] < shrink_step]
+        after = [e for e in eval_trace if e[0] >= shrink_step]
+        if not before or not after:
+            continue
+        before_acc = before[-1][2]
+        after_acc = after[0][2]
+        regression = before_acc - after_acc
+        # CNN accuracy is higher and therefore more sensitive to noise at a
+        # single eval point; allow a slightly larger tolerance than the MLP.
+        assert regression <= 0.08, (
+            f"accuracy regressed {regression * 100:.2f}pp across shrink at "
+            f"step {shrink_step}: before={before_acc * 100:.2f}%, "
+            f"after={after_acc * 100:.2f}%"
+        )
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -737,16 +900,33 @@ def main() -> None:
     parser.add_argument("--data-root", default=os.path.expanduser("~/.cache/cifar10"),
                         help="Where to download/load CIFAR-10")
     parser.add_argument("--long", action="store_true",
-                        help="Long convergence run (4500 steps, shrinks at "
-                             "1500/2500/3500, eval every 500 steps)")
+                        help="Long MLP convergence run (4500 steps, shrinks "
+                             "at 1500/2500/3500, eval every 500 steps)")
+    parser.add_argument("--cnn", action="store_true",
+                        help="CNN convergence run (6000 steps, shrinks at "
+                             "2000/3500/5000, eval every 500 steps)")
     parser.add_argument("--eval-every", type=int, default=0,
                         help="Eval test-set accuracy every N steps (0 = disabled)")
     args = parser.parse_args()
 
+    if args.long and args.cnn:
+        parser.error("pass at most one of --long / --cnn")
+
     out_dir = args.out_dir or tempfile.mkdtemp(prefix="cifar_elastic_")
     print(f"Writing traces to {out_dir}")
 
-    if args.long:
+    if args.cnn:
+        kwargs = dict(
+            total_steps=CNN_TOTAL_STEPS,
+            shrink_schedule=CNN_SHRINK_SCHEDULE,
+            eval_every=CNN_EVAL_EVERY,
+            batch_size=CNN_BATCH_SIZE,
+            lr=CNN_LR,
+            worker_timeout=CNN_WORKER_TIMEOUT,
+            model_name="cnn",
+        )
+        schedule_for_analysis = CNN_SHRINK_SCHEDULE
+    elif args.long:
         kwargs = dict(
             total_steps=LONG_TOTAL_STEPS,
             shrink_schedule=LONG_SHRINK_SCHEDULE,
