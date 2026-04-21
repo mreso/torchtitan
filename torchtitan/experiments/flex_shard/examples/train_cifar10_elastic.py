@@ -337,6 +337,9 @@ def _worker(
 
     loss_trace: list[tuple[int, int, float]] = []
     eval_trace: list[tuple[int, int, float, float]] = []  # step, ws, acc, xent
+    # Boundary evals: one pre and one post per shrink, *no* optimizer.step in
+    # between. Rows: (step, ws, phase, acc, xent) with phase in {"pre", "post"}.
+    boundary_trace: list[tuple[int, int, str, float, float]] = []
     events: list[dict[str, Any]] = []
 
     try:
@@ -384,6 +387,15 @@ def _worker(
             # index already run on the new group.
             if pending_shrinks and step == pending_shrinks[0][0]:
                 _step, ranks_to_remove = pending_shrinks.pop(0)
+                # Boundary eval PRE: same weights, old sharding. Every rank
+                # participates in the forward collective; only rank 0 logs.
+                pre_acc, pre_xent = _evaluate_accuracy(
+                    model, test_images, test_labels
+                )
+                if rank == 0:
+                    boundary_trace.append(
+                        (step, current_world_size, "pre", pre_acc, pre_xent)
+                    )
                 events.append({
                     "step": step,
                     "rank": rank,
@@ -409,6 +421,16 @@ def _worker(
                     break
                 mesh = new_mesh
                 current_world_size = new_mesh.size()
+                # Boundary eval POST: same weights (shrink does not mutate
+                # them), new sharding. No optimizer.step has run since PRE,
+                # so accuracy MUST equal pre_acc bit-exactly.
+                post_acc, post_xent = _evaluate_accuracy(
+                    model, test_images, test_labels
+                )
+                if rank == 0:
+                    boundary_trace.append(
+                        (step, current_world_size, "post", post_acc, post_xent)
+                    )
 
             idx = torch.randint(0, N, (batch_size,), generator=rng)
             x = images[idx]
@@ -459,6 +481,16 @@ def _worker(
                 for row in eval_trace:
                     w.writerow(row)
 
+        if boundary_trace:
+            boundary_path = Path(out_dir) / f"rank{rank}_boundary.csv"
+            with boundary_path.open("w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow([
+                    "step", "world_size", "phase", "test_accuracy", "test_xent",
+                ])
+                for row in boundary_trace:
+                    w.writerow(row)
+
         return {
             "rank": rank,
             "departed": departed,
@@ -467,6 +499,7 @@ def _worker(
             "events": events,
             "final_world_size": current_world_size,
             "eval_trace": eval_trace,
+            "boundary_trace": boundary_trace,
         }
     finally:
         try:
@@ -566,9 +599,22 @@ def analyze(
     out_dir = Path(out_dir)
     per_rank: dict[int, list[tuple[int, int, float]]] = {}
     per_rank_eval: dict[int, list[tuple[int, int, float, float]]] = {}
+    per_rank_boundary: dict[int, list[tuple[int, int, str, float, float]]] = {}
     for csv_path in sorted(out_dir.glob("rank*.csv")):
         stem = csv_path.stem
-        if stem.endswith("_eval"):
+        if stem.endswith("_boundary"):
+            rank = int(stem.removesuffix("_boundary").removeprefix("rank"))
+            rows_b: list[tuple[int, int, str, float, float]] = []
+            with csv_path.open() as f:
+                r = csv.reader(f)
+                next(r)
+                for row in r:
+                    rows_b.append(
+                        (int(row[0]), int(row[1]), row[2],
+                         float(row[3]), float(row[4]))
+                    )
+            per_rank_boundary[rank] = rows_b
+        elif stem.endswith("_eval"):
             rank = int(stem.removesuffix("_eval").removeprefix("rank"))
             rows_eval: list[tuple[int, int, float, float]] = []
             with csv_path.open() as f:
@@ -596,6 +642,7 @@ def analyze(
         "ok": True,
         "per_rank_step_counts": {r: len(t) for r, t in per_rank.items()},
         "eval_trace": per_rank_eval.get(0, []),
+        "boundary_trace": per_rank_boundary.get(0, []),
     }
     for shrink_step, ranks_to_remove in shrink_schedule:
         pre = _moving_window_avg(rank0, shrink_step, SPIKE_WINDOW)
@@ -636,6 +683,28 @@ def _print_report(results: list[dict], analysis: dict[str, Any]) -> None:
         for step, ws, acc, xent in analysis["eval_trace"]:
             print(f"  step {step:>5}  ws={ws}  acc={acc * 100:5.2f}%  "
                   f"xent={xent:.4f}")
+    if analysis.get("boundary_trace"):
+        print()
+        print("Shrink boundary eval (no training between pre and post):")
+        # Group by step so pre/post sit next to each other.
+        by_step: dict[int, dict[str, tuple]] = {}
+        for step, ws, phase, acc, xent in analysis["boundary_trace"]:
+            by_step.setdefault(step, {})[phase] = (ws, acc, xent)
+        print(f"  {'step':>5}  {'pre_ws':>6}  {'pre_acc':>8}  "
+              f"{'pre_xent':>9}  {'post_ws':>7}  {'post_acc':>9}  "
+              f"{'post_xent':>10}  {'delta_acc':>10}")
+        for step in sorted(by_step):
+            pair = by_step[step]
+            pre = pair.get("pre")
+            post = pair.get("post")
+            if pre is None or post is None:
+                continue
+            pre_ws, pre_acc, pre_xent = pre
+            post_ws, post_acc, post_xent = post
+            delta = (post_acc - pre_acc) * 100
+            print(f"  {step:>5}  {pre_ws:>6}  {pre_acc * 100:>7.4f}%  "
+                  f"{pre_xent:>9.4f}  {post_ws:>7}  {post_acc * 100:>8.4f}%  "
+                  f"{post_xent:>10.4f}  {delta:>+9.4f}pp")
     print()
     print(f"Verdict: {'OK' if analysis['ok'] else 'SPIKE DETECTED'}")
     print("=" * 64)
@@ -673,6 +742,22 @@ def test_cifar10_elastic_no_loss_spike(tmp_path):
     assert analysis["ok"], (
         f"loss spiked across at least one shrink boundary: {analysis['per_shrink']}"
     )
+
+    # Boundary evals must be bit-exact pre/post shrink on every rank-0
+    # boundary (no training in between, weights unchanged, data unchanged).
+    boundary = analysis["boundary_trace"]
+    assert boundary, "no boundary evals recorded"
+    by_step_s: dict[int, dict[str, tuple]] = {}
+    for step, ws, phase, acc, xent in boundary:
+        by_step_s.setdefault(step, {})[phase] = (ws, acc, xent)
+    for step, pair in sorted(by_step_s.items()):
+        _, pre_acc, pre_xent = pair["pre"]
+        _, post_acc, post_xent = pair["post"]
+        assert pre_acc == post_acc, (
+            f"boundary accuracy diverged at step {step}: "
+            f"pre={pre_acc * 100:.6f}%  post={post_acc * 100:.6f}%"
+        )
+        assert pre_xent == post_xent
 
 
 # Long convergence schedule: stretch the shrink boundaries across a longer
@@ -782,6 +867,29 @@ def test_cifar10_elastic_converges_across_shrinks(tmp_path):
             f"after={after_acc * 100:.2f}%"
         )
 
+    # (f) Boundary eval pairs: with no training between pre and post, the
+    # shrink must preserve accuracy bit-exactly (weights unchanged, input
+    # identical → same logits → same argmax → same correct-count).
+    boundary = analysis["boundary_trace"]
+    assert boundary, "no boundary evals recorded"
+    by_step_m: dict[int, dict[str, tuple]] = {}
+    for step, ws, phase, acc, xent in boundary:
+        by_step_m.setdefault(step, {})[phase] = (ws, acc, xent)
+    for step, pair in sorted(by_step_m.items()):
+        assert "pre" in pair and "post" in pair, (
+            f"shrink at step {step}: missing pre or post boundary eval"
+        )
+        _, pre_acc, pre_xent = pair["pre"]
+        _, post_acc, post_xent = pair["post"]
+        assert pre_acc == post_acc, (
+            f"boundary accuracy diverged at step {step}: "
+            f"pre={pre_acc * 100:.6f}%  post={post_acc * 100:.6f}%"
+        )
+        assert pre_xent == post_xent, (
+            f"boundary xent diverged at step {step}: "
+            f"pre={pre_xent:.10f}  post={post_xent:.10f}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # CNN convergence run: demonstrate higher accuracy preserved across shrinks
@@ -882,6 +990,31 @@ def test_cifar10_elastic_cnn_converges_across_shrinks(tmp_path):
             f"accuracy regressed {regression * 100:.2f}pp across shrink at "
             f"step {shrink_step}: before={before_acc * 100:.2f}%, "
             f"after={after_acc * 100:.2f}%"
+        )
+
+    # (f) Boundary eval pairs (no training between pre and post): accuracy
+    # and xent must match bit-exactly, because the shrink preserves full
+    # weights and the input is deterministic.
+    boundary = analysis["boundary_trace"]
+    assert boundary, "no boundary evals recorded"
+    # Group by step so we can compare (pre, post) pairs.
+    by_step: dict[int, dict[str, tuple]] = {}
+    for step, ws, phase, acc, xent in boundary:
+        by_step.setdefault(step, {})[phase] = (ws, acc, xent)
+    for step, pair in sorted(by_step.items()):
+        assert "pre" in pair and "post" in pair, (
+            f"shrink at step {step}: missing pre or post boundary eval"
+        )
+        _, pre_acc, pre_xent = pair["pre"]
+        _, post_acc, post_xent = pair["post"]
+        assert pre_acc == post_acc, (
+            f"boundary accuracy diverged across shrink at step {step}: "
+            f"pre={pre_acc * 100:.6f}%, post={post_acc * 100:.6f}% "
+            f"(weights unchanged, input unchanged — accuracy must be equal)"
+        )
+        assert pre_xent == post_xent, (
+            f"boundary xent diverged across shrink at step {step}: "
+            f"pre={pre_xent:.10f}, post={post_xent:.10f}"
         )
 
 
