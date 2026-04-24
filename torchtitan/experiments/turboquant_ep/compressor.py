@@ -26,6 +26,65 @@ from turboquant import TurboQuantMSE
 _QUANTIZER_CACHE: dict[tuple[int, int, int, torch.device], TurboQuantMSE] = {}
 
 
+# --- Wire-byte instrumentation -----------------------------------------------
+# Per-rank counters incremented on every TurboQuant a2a call. We track both the
+# actual packed bytes sent and the bf16 bytes the baseline ExpertParallel would
+# have sent for the same routing decision, so the savings ratio is observed
+# from real workload traces (not just analytical formulas). atexit dumps a
+# summary on rank 0 so both the compressed and "would-have-been-bf16" totals
+# come from a single TQ run; no need to instrument the baseline path.
+_WIRE_STATS = {
+    "fwd_calls": 0,
+    "fwd_tokens": 0,
+    "fwd_packed_bytes": 0,
+    "fwd_bf16_bytes": 0,
+    "bwd_calls": 0,
+    "bwd_tokens": 0,
+    "bwd_packed_bytes": 0,
+    "bwd_bf16_bytes": 0,
+}
+
+
+def _record_wire_call(*, leg: str, tokens: int, hidden_dim: int, dim: int,
+                      bits: int, dtype: torch.dtype) -> None:
+    packed = tokens * packed_bytes_per_token(hidden_dim, dim, bits, dtype)
+    bf16 = tokens * hidden_dim * 2  # bf16 = 2 bytes/elem; what baseline sends
+    _WIRE_STATS[f"{leg}_calls"] += 1
+    _WIRE_STATS[f"{leg}_tokens"] += tokens
+    _WIRE_STATS[f"{leg}_packed_bytes"] += packed
+    _WIRE_STATS[f"{leg}_bf16_bytes"] += bf16
+
+
+def _dump_wire_stats() -> None:
+    import os
+    rank = int(os.environ.get("RANK", "0"))
+    if rank != 0:
+        return
+    s = _WIRE_STATS
+    total_packed = s["fwd_packed_bytes"] + s["bwd_packed_bytes"]
+    total_bf16 = s["fwd_bf16_bytes"] + s["bwd_bf16_bytes"]
+    if total_bf16 == 0:
+        return
+    saved = total_bf16 - total_packed
+    ratio = total_bf16 / max(total_packed, 1)
+    gib = lambda b: b / (1024**3)
+    print(
+        "\n[turboquant wire-bytes summary, rank 0]\n"
+        f"  forward  : calls={s['fwd_calls']:>6d}  tokens={s['fwd_tokens']:>12d}  "
+        f"packed={gib(s['fwd_packed_bytes']):.3f} GiB  bf16-equiv={gib(s['fwd_bf16_bytes']):.3f} GiB\n"
+        f"  backward : calls={s['bwd_calls']:>6d}  tokens={s['bwd_tokens']:>12d}  "
+        f"packed={gib(s['bwd_packed_bytes']):.3f} GiB  bf16-equiv={gib(s['bwd_bf16_bytes']):.3f} GiB\n"
+        f"  TOTAL    : packed={gib(total_packed):.3f} GiB  bf16-equiv={gib(total_bf16):.3f} GiB  "
+        f"saved={gib(saved):.3f} GiB  ratio={ratio:.2f}x\n",
+        flush=True,
+    )
+
+
+import atexit as _atexit
+_atexit.register(_dump_wire_stats)
+# -----------------------------------------------------------------------------
+
+
 def get_quantizer(
     dim: int, bits: int, seed: int, device: torch.device
 ) -> TurboQuantMSE:
@@ -181,6 +240,11 @@ class TurboQuantA2A(torch.autograd.Function):
         received = torch.ops._c10d_functional.wait_tensor(received)
         x_hat = _unpack_and_dequantize(received, quantizer, hidden_dim, x.dtype)
 
+        _record_wire_call(
+            leg="fwd", tokens=int(sum(input_splits)), hidden_dim=hidden_dim,
+            dim=dim, bits=bits, dtype=x.dtype,
+        )
+
         ctx.input_splits = input_splits
         ctx.output_splits = output_splits
         ctx.group = group
@@ -216,6 +280,11 @@ class TurboQuantA2A(torch.autograd.Function):
             received = all_to_all_single(grad_packed, ctx.input_splits, ctx.output_splits, ctx.group)
             received = torch.ops._c10d_functional.wait_tensor(received)
             grad_in = _unpack_and_dequantize(received, quantizer, ctx.hidden_dim, ctx.input_dtype)
+            _record_wire_call(
+                leg="bwd", tokens=int(sum(ctx.output_splits)),
+                hidden_dim=ctx.hidden_dim, dim=ctx.dim, bits=ctx.bits,
+                dtype=ctx.input_dtype,
+            )
         else:
             received = all_to_all_single(grad_out, ctx.input_splits, ctx.output_splits, ctx.group)
             grad_in = torch.ops._c10d_functional.wait_tensor(received)
