@@ -2,6 +2,12 @@
 
 Launch: torchrun --nproc_per_node=N main.py --num_failures F --hidden H
 
+With --device cuda (default), ranks map onto physical GPUs by
+`local_rank % torch.cuda.device_count()`, so nproc_per_node may exceed the
+GPU count to oversubscribe (useful for correctness tests at larger N on a
+small box). With --device cpu, the whole PoC runs over the gloo backend,
+letting N scale to tens of ranks bounded only by RAM.
+
 Reconstruction runs in GF(2^16) on the raw bytes of every weight tensor, so
 recovery is bit-exact: reconstructed weights equal the originals byte-for-byte
 regardless of the tensor's dtype (any dtype whose element size is a multiple
@@ -33,6 +39,7 @@ import argparse
 import itertools
 import math
 import os
+import resource
 import sys
 
 import torch
@@ -40,6 +47,36 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
+
+
+def _sync_device(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def _reset_peak(device):
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+
+def _resident_bytes(device):
+    """Current allocator residency for the device. For CPU, fall back to
+    process RSS in bytes. RSS is coarser (includes everything the process
+    holds, not just our tensors) so persistent-delta comparisons still work
+    but the absolute baseline will be much larger than a pure-CUDA run."""
+    if device.type == "cuda":
+        return torch.cuda.memory_allocated()
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+
+
+def _peak_bytes(device):
+    if device.type == "cuda":
+        return torch.cuda.max_memory_allocated()
+    # ru_maxrss is cumulative over the process lifetime, so on CPU "peak" and
+    # "resident" are the same high-water mark. peak_delta thus undercounts
+    # encode transients on CPU; use the GPU path for precise peak numbers.
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
 
 
 def parse_args():
@@ -56,6 +93,11 @@ def parse_args():
     p.add_argument("--measure_memory", action="store_true",
                    help="Skip the gather+reconstruct+verify loop; only "
                         "encode parity and print per-rank memory deltas.")
+    p.add_argument("--device", type=str, default="cuda",
+                   choices=["cuda", "cpu"],
+                   help="Where to run. cuda uses NCCL and binds each rank "
+                        "to local_rank %% device_count (so nproc_per_node "
+                        "may exceed GPU count). cpu uses gloo.")
     return p.parse_args()
 
 
@@ -252,8 +294,25 @@ def main():
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl")
+
+    if args.device == "cuda":
+        num_gpus = torch.cuda.device_count()
+        if num_gpus == 0:
+            raise RuntimeError("--device cuda but no GPUs visible")
+        # Wrap around the physical GPU count so nproc_per_node can exceed
+        # it. NCCL forbids >1 rank per GPU in a single communicator, so the
+        # oversubscribed case uses gloo on CUDA tensors (CPU-staged
+        # collectives). Pure 1-rank-per-GPU still uses NCCL.
+        gpu_id = local_rank % num_gpus
+        torch.cuda.set_device(gpu_id)
+        device = torch.device(f"cuda:{gpu_id}")
+        backend = "gloo" if world_size > num_gpus else "nccl"
+        mesh_device = "cuda"
+    else:
+        device = torch.device("cpu")
+        backend = "gloo"
+        mesh_device = "cpu"
+    dist.init_process_group(backend=backend)
 
     N = world_size
     F = args.num_failures
@@ -299,7 +358,6 @@ def main():
             f"{args.model_dtype} has element_size={element_size}"
         )
 
-    device = torch.device(f"cuda:{local_rank}")
     exp_t, log_t = _make_gf_tables_on(device)
 
     torch.manual_seed(args.seed)
@@ -314,7 +372,7 @@ def main():
     else:
         true_weights_syms = None
 
-    mesh = init_device_mesh("cuda", (N,))
+    mesh = init_device_mesh(mesh_device, (N,))
     fully_shard(full_model, mesh=mesh)
 
     for layer in full_model.layers:
@@ -339,11 +397,10 @@ def main():
     # Drop verification scratch and wait for every rank to settle before
     # baseline-ing memory so that transient allocations don't pollute the
     # resident reading.
-    torch.cuda.synchronize()
+    _sync_device(device)
     dist.barrier()
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    baseline_resident = torch.cuda.memory_allocated()
+    _reset_peak(device)
+    baseline_resident = _resident_bytes(device)
 
     # ---------- Encode parity per parameter ----------
     # all_gather every rank's shard once per layer; each rank then XOR-
@@ -393,11 +450,12 @@ def main():
             del all_blocks, gathered_shards, gathered_byte_buffers
 
     # Measure memory after the encode collectives have released their scratch.
-    torch.cuda.synchronize()
+    _sync_device(device)
     dist.barrier()
-    encode_peak = torch.cuda.max_memory_allocated()
-    torch.cuda.empty_cache()
-    encode_resident = torch.cuda.memory_allocated()
+    encode_peak = _peak_bytes(device)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    encode_resident = _resident_bytes(device)
 
     per_rank_parity_bytes = sum(
         v.numel() * v.element_size() for d in parity_store for v in d.values()
@@ -441,8 +499,8 @@ def main():
             f"info-minimum for (N={N}, F={F}) is {100 * info_min_ratio:.2f}%)",
             flush=True,
         )
-        print(f"[memory] --- measured (torch.cuda allocator, per-rank) ---",
-              flush=True)
+        src = "torch.cuda allocator" if device.type == "cuda" else "RSS, coarse"
+        print(f"[memory] --- measured ({src}, per-rank) ---", flush=True)
         for r in range(N):
             persist = res_counts[r] - base_counts[r]
             peak = peak_counts[r] - base_counts[r]
