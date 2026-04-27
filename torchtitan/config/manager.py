@@ -102,18 +102,20 @@ class ConfigManager:
         # Import config_registry from module based on module specification
         if module_name in all_supported:
             # short module from supported module list  (search models first, then experiments)
+            last_err: ImportError | None = None
             for prefix in ("torchtitan.models", "torchtitan.experiments"):
                 module_path = f"{prefix}.{module_name}.config_registry"
                 try:
                     module = importlib.import_module(module_path)
                     break
-                except ImportError:
+                except ImportError as e:
+                    last_err = e
                     continue
             if module is None:
                 raise ImportError(
                     f"Cannot import config_registry for module '{module_name}' "
                     f"from torchtitan.models or torchtitan.experiments"
-                )
+                ) from last_err
         else:
             # Fully qualified module path: try appending .config_registry first,
             # then fall back to importing directly (e.g., torchtitan.models.llama3
