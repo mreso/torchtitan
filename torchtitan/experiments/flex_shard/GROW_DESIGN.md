@@ -17,6 +17,90 @@ in a new sibling entry point rather than overloading `shrink_flex_shard`.
 
 ---
 
+## Implementation status (2026-05-29)
+
+`grow_flex_shard` is **implemented** in `flex_shard/flex_shard/elastic.py`
+(Phases A–H, the `broadcast_full_tensors` primitive, `GrowReport`, joiner
+bootstrap) per this plan, with the review amendments folded in.
+
+Verified on 8x H100:
+- **Grow logic — torchft-free (PASS).** 2→4 via a `dist.new_group` superset:
+  survivors re-shard via `_reshard_bucket_storage`, joiners bootstrap via
+  `flex_shard`+`copy_param_to_storage`. Weights bitwise-preserved
+  (`max|Δ full weight| = 0`, gather over the grown world == pre-grow), joiner
+  shards correct, logits invariant (`max|Δlogit| = 0`), and **post-grow training
+  (reduce-scatter at ws=4) runs and converges**. Covered by
+  `tests/test_elastic_grow.py`.
+- **Grow transfer — real torchft (PARTIAL).** Under `FakeManager` +
+  `ProcessGroupNCCL`, the weight/optimizer/logit transfer is bitwise-correct
+  (`max|Δ full weight| = 0`, `max|Δlogit| = 0`), and `all_reduce` / `all_gather`
+  / `reduce_scatter_tensor_coalesced` all work standalone on the grown comm.
+
+Known gap (real-torchft post-grow training):
+- The FlexShard **training** path (side-stream collectives via the bucket hooks)
+  aborts the freshly-grown `FakeManager` comm on the first training iteration
+  ("NCCL communicator was aborted" / "unhandled system error"). It does **not**
+  reproduce torchft-free, and shrink's analogous *reconfigured* comm trains
+  fine — so this is a torchft non-blocking-comm grow-lifecycle issue (survivors
+  abort the old ws=N comm + joiners create their first comm), the kind a real
+  `torchft.Manager` + Lighthouse coordinates and the `FakeManager` stub does
+  not. Tracking as M4 ("real torchft e2e grow"): retry with a real Manager
+  and/or a comm warm-up/blocking-mode handshake before the first hooked
+  training step.
+
+---
+
+## Review outcome (empirically validated 2026-05-29)
+
+This design was adversarially reviewed and the two highest-risk claims were
+probed on real hardware (8x H100, real torchft `ProcessGroupNCCL`). Verdict:
+**sound, with the amendments below.** No hard blocker.
+
+Confirmed empirically:
+- **`BroadcastOptions.rootRank` is GROUP-LOCAL, not global** (probe over global
+  ranks `[1,2]`, `rootRank=1` → everyone got global-2's value). The
+  `root_local = new_global_ranks.index(root_global)` mapping in §4 is correct
+  and load-bearing.
+- **Grow-reshard works with existing primitives unchanged** (4-rank superset
+  2→4: survivors via `_reshard_bucket_storage`, joiners via
+  `flex_shard`+`copy_param_to_storage`; all ranks got the correct `Shard(0)`
+  slice bit-exactly, incl. the uneven last shard).
+- `flex_shard()` launches **zero** collectives; meta path correctly *rejected*
+  (raises `Expected ... CUDA` at `bucket_runtime.py:731`) → joiner builds an
+  **uninitialized CUDA** model; joiner `dist.get_rank()` is global; hash check +
+  first-time joiner `configure` work on the grown PG.
+
+Amendments folded into the plan below:
+1. **Joiner optimizer is a new code path, not a reuse.** `_reshard_optimizer_state`
+   loops `optimizer.state.keys()` (empty on a joiner ⇒ no-op). The joiner builds
+   `optimizer_factory(model)` then *creates* `state[new_param]` from the
+   broadcast moments. Factor the "full-moment → local-shard" slice into a shared
+   helper. (§3 Phase G)
+2. **`step` is a per-param *tensor*, not gathered by Phase B.** Survivors copy it
+   through; joiners have none ⇒ broadcast it explicitly as a 1-element tensor
+   (not a Python scalar). (§3 Phase G)
+3. **Phase-B drain is mandatory** (not optional): survivors must
+   `_cuda_sync_if_available()` before `start_quorum` so side-stream all-gathers
+   complete before `configure` aborts the old backend (the abort race was
+   observed: `NCCL WARN job error 3`). (§3 Phase B)
+4. **Monotonic class leak (grow-specific).** `_install_module_unsharded_param_getters`
+   injects a new per-leaf subclass into `sys.modules` on every `flex_shard`
+   (`unsharded_param_getters.py:106`), never freed (+40 over 20 calls). Shrink
+   never re-runs `flex_shard`; grow's joiner bootstrap does. v1: accept +
+   document; preferred fix: cache the generated class by
+   `(base_cls, frozenset(param_names))` or drop the `sys.modules` injection.
+5. **Add a dtype/`requires_grad` parity check** (broadcast carries values only):
+   fold `{fqn:(shape,dtype,requires_grad)}` into the Phase-D agreement hash.
+6. **Test RAF=`True` across grow** (pre-existing op-set mismatch in
+   `reshard_after_forward.py`); close before claiming RAF support.
+
+Dropped as over-engineered:
+- **The Phase-C post-grow `pg.barrier()` is unnecessary** — the Phase-D
+  agreement hash already proves the grown PG works before any weight transfer;
+  probes succeeded without a barrier. Default it OFF.
+
+---
+
 ## 0. Why grow is fundamentally different from shrink
 
 Shrink is "everyone is already in the PG; gather, then drop ranks, then

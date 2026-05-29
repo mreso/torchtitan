@@ -5,11 +5,14 @@
 # LICENSE file in the root directory of this source tree.
 
 from .flex_shard import (
+    broadcast_full_tensors,
     BucketSpec,
     flex_shard,
     gather_full_tensors,
     get_global_shape,
     get_placements,
+    GrowReport,
+    grow_flex_shard,
     is_flex_shard_param,
     LocalStorageLayout,
     MixedPrecisionPolicy,
@@ -22,11 +25,14 @@ from .flex_shard import (
 
 
 __all__ = [
+    "broadcast_full_tensors",
     "BucketSpec",
     "flex_shard",
     "gather_full_tensors",
     "get_global_shape",
     "get_placements",
+    "GrowReport",
+    "grow_flex_shard",
     "is_flex_shard_param",
     "LocalStorageLayout",
     "MixedPrecisionPolicy",

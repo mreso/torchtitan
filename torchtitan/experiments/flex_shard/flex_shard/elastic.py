@@ -42,10 +42,11 @@ Key facts that make the in-place reshard sound on this FlexShard layout:
 
 Scope (v1). Supported: ``Shard``/per-param and other gather/scatter placements
 that implement the bucket-unshard contract, single- and multi-bucket models,
-mixed precision, Adam-style optimizer state, successive shrinks (4->3->2...).
-Not supported (raises): group *growth*, ``fused=True`` / ``capturable=True``
-optimizers, 2D/HSDP meshes, CPU offload buckets, ``torch.compile`` capture
-during the shrink. CUDA/NCCL only (FlexShard core mandates a CUDA mesh).
+mixed precision, Adam-style optimizer state, successive shrinks (4->3->2...) and
+successive grows (:func:`grow_flex_shard`, 1->2->4...). Not supported (raises):
+``fused=True`` / ``capturable=True`` optimizers, 2D/HSDP meshes, CPU offload
+buckets, ``torch.compile`` capture during the transition. CUDA/NCCL only
+(FlexShard core mandates a CUDA mesh).
 """
 
 from __future__ import annotations
@@ -53,7 +54,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.distributed as dist
@@ -62,11 +63,19 @@ from torch.distributed.device_mesh import _get_device_handle, DeviceMesh
 from torch.distributed.distributed_c10d import ProcessGroup
 
 from .bucket_comm import begin_bucket_unshard
-from .bucket_storage import ShardedBucketStorage
+from .bucket_storage import BucketSpec, ShardedBucketStorage
+from .flex_shard import flex_shard
 from .sharded_param import set_sharding_info
 
 
-__all__ = ["gather_full_tensors", "ShrinkReport", "shrink_flex_shard"]
+__all__ = [
+    "broadcast_full_tensors",
+    "gather_full_tensors",
+    "GrowReport",
+    "grow_flex_shard",
+    "ShrinkReport",
+    "shrink_flex_shard",
+]
 
 
 @dataclass
@@ -761,4 +770,358 @@ def shrink_flex_shard(
         dropped_ranks=list(ranks_to_remove),
         elapsed_seconds=time.monotonic() - start_time,
         resident_bytes_per_rank=resident_bytes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Grow: add ranks to the DP group (inverse of shrink)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GrowReport:
+    """Summary returned from :func:`grow_flex_shard`.
+
+    Fields:
+        new_world_size: Size of the post-grow group (``N + len(added_ranks)``).
+        added_ranks: The ranks that joined, in input order.
+        is_joiner: True on a brand-new rank, False on a survivor.
+        elapsed_seconds: Wall-clock time spent inside ``grow_flex_shard``.
+        resident_bytes_per_rank: Largest bucket's sharded byte buffer after grow.
+        model / optimizer: On a joiner, the freshly constructed objects the
+            caller must now own (``None`` on survivors, who already own theirs).
+    """
+
+    new_world_size: int
+    added_ranks: list[int] = field(default_factory=list)
+    is_joiner: bool = False
+    elapsed_seconds: float = 0.0
+    resident_bytes_per_rank: int = 0
+    model: nn.Module | None = None
+    optimizer: torch.optim.Optimizer | None = None
+
+
+def _broadcast_one(
+    buf_or_none: torch.Tensor | None,
+    *,
+    shape: Any,
+    dtype: torch.dtype,
+    device: torch.device,
+    pg: ProcessGroup,
+    root_local: int,
+) -> torch.Tensor:
+    """Broadcast one tensor from ``root_local`` (mesh-local) to all ranks.
+
+    Uses the ProcessGroup ``broadcast`` method (in PyTorch's PyProcessGroup
+    trampoline, so torchft's wrapper intercepts it) rather than
+    ``dist.broadcast`` (which routes through ``_broadcast_oop``, not in the
+    trampoline). ``root_local`` is the root's MESH-LOCAL rank because
+    ``BroadcastOptions.rootRank`` indexes the group, not the global world.
+    """
+    buf = (
+        buf_or_none.contiguous()
+        if buf_or_none is not None
+        else torch.empty(shape, dtype=dtype, device=device)
+    )
+    opts = dist.BroadcastOptions()
+    opts.rootRank = root_local
+    pg.broadcast([buf], opts).wait()
+    return buf
+
+
+def broadcast_full_tensors(
+    full_by_fqn: dict[str, torch.Tensor] | None,
+    infos: list[Any],
+    mesh: DeviceMesh,
+    root_local_rank: int,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Broadcast each parameter's full tensor from the root to every rank.
+
+    ``full_by_fqn`` is the real ``{fqn: full_tensor}`` on the root and ``None``
+    on every other rank (which allocates a receive buffer from each
+    ``ParamInfo``'s ``global_shape``/``dtype``). Returns ``{fqn: full_tensor}``
+    on every rank. This is the grow-side transfer primitive (the inverse of
+    :func:`gather_full_tensors`).
+    """
+    pg = mesh.get_group()
+    out: dict[str, torch.Tensor] = {}
+    for info in infos:
+        src = None if full_by_fqn is None else full_by_fqn[info.fqn]
+        out[info.fqn] = _broadcast_one(
+            src,
+            shape=info.global_shape,
+            dtype=info.dtype,
+            device=device,
+            pg=pg,
+            root_local=root_local_rank,
+        )
+    return out
+
+
+def grow_flex_shard(
+    model: nn.Module | None,
+    optimizer: torch.optim.Optimizer | None,
+    ranks_to_add: list[int],
+    *,
+    manager: Any,
+    model_factory: Callable[[DeviceMesh], nn.Module] | None = None,
+    optimizer_factory: Callable[[nn.Module], torch.optim.Optimizer] | None = None,
+    buckets: list[BucketSpec] | None = None,
+    timeout: timedelta = timedelta(seconds=300),
+) -> tuple[DeviceMesh, GrowReport]:
+    """Grow a FlexShard DP group by adding ranks; re-shard onto the larger world.
+
+    Every rank in the *new* world calls this collectively with identical
+    ``ranks_to_add``. Role is auto-detected: a rank is a **joiner** iff its
+    global ``dist.get_rank()`` is in ``ranks_to_add``, else a **survivor**.
+
+    Survivor contract: pass the live ``model`` (with ``sharded_bucket_storages``)
+    and its ``optimizer`` (or ``None``). ``model_factory`` / ``optimizer_factory``
+    / ``buckets`` are ignored.
+
+    Joiner contract: pass ``model=None``, ``optimizer=None``, plus a
+    ``model_factory`` that builds an *uninitialized CUDA* module matching the
+    survivors' architecture bit-for-bit (same FQNs/shapes/dtypes/requires_grad),
+    the same ``buckets``, and an ``optimizer_factory``. The constructed model and
+    optimizer are returned on the ``GrowReport``.
+
+    Whether an optimizer is used must agree across all ranks (survivors pass
+    ``optimizer``; joiners pass ``optimizer_factory``) — the optimizer-state
+    transfer is a collective.
+    """
+    start_time = time.monotonic()
+    _validate_manager(manager)
+
+    if not ranks_to_add:
+        raise ValueError("grow_flex_shard: ranks_to_add is empty")
+    if len(set(ranks_to_add)) != len(ranks_to_add):
+        raise ValueError(f"ranks_to_add contains duplicates: {ranks_to_add}")
+
+    my_rank = dist.get_rank()
+    is_joiner = my_rank in set(ranks_to_add)
+
+    # ---- Phase A: role-specific validation (no collective) ----
+    storages: list[ShardedBucketStorage]
+    if not is_joiner:
+        sb = getattr(model, "sharded_bucket_storages", None)
+        if not sb:
+            raise ValueError(
+                "grow_flex_shard: survivor model has no sharded_bucket_storages"
+            )
+        storages = sb
+        bad_flag = _optimizer_has_unsupported_flags(optimizer)
+        if bad_flag is not None:
+            raise NotImplementedError(
+                f"grow_flex_shard v1 does not support optimizer flag {bad_flag!r}."
+            )
+        old_mesh = storages[0]._mesh
+        if old_mesh.mesh.ndim != 1:
+            raise ValueError("grow_flex_shard requires a 1D DeviceMesh.")
+        old_pg = old_mesh.get_group()
+        if not _is_torchft_wrapper(old_pg):
+            raise ValueError(
+                "grow_flex_shard requires a torchft ProcessGroupWrapper."
+            )
+        old_global_ranks = old_mesh.mesh.tolist()
+        old_set = set(old_global_ranks)
+        for r in ranks_to_add:
+            if r in old_set:
+                raise ValueError(
+                    f"ranks_to_add contains {r} which is already in the group "
+                    f"{old_global_ranks}"
+                )
+        device = storages[0]._byte_storage.device
+        device_type = old_mesh.device_type
+    else:
+        if model is not None:
+            raise ValueError("grow_flex_shard: joiner must pass model=None.")
+        if model_factory is None or buckets is None:
+            raise ValueError(
+                "grow_flex_shard: joiner must pass model_factory and buckets."
+            )
+        old_pg = None
+        device_type = "cuda"
+        device = torch.device("cuda", torch.cuda.current_device())
+
+    # ---- Phase B: survivors gather full weights + moments on the OLD pg ----
+    full_weights: list[dict[str, torch.Tensor]] = []
+    bucket_full_moments: dict[str, dict[str, torch.Tensor]] = {}
+    old_param_by_fqn: dict[str, nn.Parameter] = {}
+    if not is_joiner:
+        _cuda_sync_if_available()
+        for storage in storages:
+            full_weights.append(gather_full_tensors(storage))
+            bucket_full_moments.update(
+                _gather_full_moments_for_storage(storage, optimizer)
+            )
+            for fqn in _bucket_fqns(storage):
+                old_param_by_fqn[fqn] = _registered_param(storage._module, fqn)
+        # Mandatory drain: side-stream all-gathers must complete before the
+        # survivors' start_quorum reconfigures (aborts) the old backend,
+        # otherwise the abort races with in-flight work (NaN / NCCL errors).
+        _cuda_sync_if_available()
+
+    # ---- Phase C: grow the PG + rebuild the mesh (all ranks) ----
+    qr = manager.start_quorum(allow_heal=False, shrink_only=False, timeout=timeout)
+    pg = old_pg if not is_joiner else manager.pg
+    new_global_ranks = list(getattr(qr, "ranks_in_quorum"))
+    new_mesh = _rebuild_mesh(pg, new_global_ranks, device_type=device_type)
+    new_ws = len(new_global_ranks)
+    new_rank = new_mesh.get_local_rank()
+
+    # Joiner builds its model + FlexShard structure on the new mesh. flex_shard
+    # launches no collective, so this is safe mid-grow; byte storage is CUDA
+    # (uninitialized) and gets filled from the broadcast below.
+    if is_joiner:
+        model = model_factory(new_mesh)
+        flex_shard(model, new_mesh, buckets)
+        storages = model.sharded_bucket_storages
+        device = storages[0]._byte_storage.device
+
+    _cuda_sync_if_available()
+
+    # ---- Phase D: agreement on the new pg (joiners can now participate) ----
+    all_equal, per_rank_hash = _all_ranks_agree_on_hash(
+        sorted(ranks_to_add), pg, new_ws, device
+    )
+    if not all_equal:
+        raise RuntimeError(
+            "ranks_to_add diverged across ranks: "
+            f"per-rank hashes {per_rank_hash}."
+        )
+
+    # ---- Phase E: broadcast full weights from a survivor root to all ranks ----
+    add_set = set(ranks_to_add)
+    survivor_ranks = [r for r in new_global_ranks if r not in add_set]
+    root_global = min(survivor_ranks)
+    root_local = new_global_ranks.index(root_global)
+    am_root = my_rank == root_global
+
+    # Non-root survivors don't supply the broadcast; free their Phase B copies.
+    if not is_joiner and not am_root:
+        full_weights = []
+        bucket_full_moments = {}
+
+    full_w_all: list[dict[str, torch.Tensor]] = []
+    for idx, storage in enumerate(storages):
+        infos = [storage._param_infos[fqn] for fqn in _bucket_fqns(storage)]
+        src = full_weights[idx] if am_root else None
+        full_w_all.append(
+            broadcast_full_tensors(src, infos, new_mesh, root_local, device)
+        )
+
+    # ---- Phase F: re-shard weights onto the new (larger) mesh ----
+    if not is_joiner:
+        for storage, full in zip(storages, full_w_all, strict=True):
+            _reshard_bucket_storage(storage, full, new_mesh)
+    else:
+        # Joiner storages were built on new_mesh by flex_shard; refill their
+        # byte buffers in place (params already view those bytes).
+        for storage, full in zip(storages, full_w_all, strict=True):
+            for fqn in _bucket_fqns(storage):
+                info = storage._param_infos[fqn]
+                info.placement.copy_param_to_storage(
+                    storage._byte_storage, info, full[fqn], new_rank, new_ws
+                )
+
+    # ---- Phase G: optimizer state ----
+    use_optimizer = (optimizer is not None) or (
+        is_joiner and optimizer_factory is not None
+    )
+    if use_optimizer:
+        # Agree on whether moment state exists (root has it iff a step ran).
+        flag_src = (
+            torch.tensor([1 if bucket_full_moments else 0], dtype=torch.int64,
+                         device=device)
+            if am_root
+            else None
+        )
+        has_state = bool(
+            int(
+                _broadcast_one(
+                    flag_src, shape=(1,), dtype=torch.int64, device=device,
+                    pg=pg, root_local=root_local,
+                ).item()
+            )
+        )
+
+        full_moments_all: dict[str, dict[str, torch.Tensor]] = {}
+        step_value = 0.0
+        if has_state:
+            for storage in storages:
+                infos = [storage._param_infos[fqn] for fqn in _bucket_fqns(storage)]
+                for key in _CANONICAL_ADAM_MOMENT_KEYS:
+                    src = (
+                        {fqn: bucket_full_moments[fqn][key]
+                         for fqn in _bucket_fqns(storage)}
+                        if am_root
+                        else None
+                    )
+                    full_k = broadcast_full_tensors(
+                        src, infos, new_mesh, root_local, device
+                    )
+                    for fqn in _bucket_fqns(storage):
+                        full_moments_all.setdefault(fqn, {})[key] = full_k[fqn]
+            # Broadcast a single step scalar (per-param tensor on each rank).
+            root_step = None
+            if am_root and optimizer is not None:
+                for st in optimizer.state.values():
+                    s = st.get("step")
+                    if isinstance(s, torch.Tensor):
+                        root_step = s.reshape(1).to(device=device, dtype=torch.float64)
+                        break
+            step_value = float(
+                _broadcast_one(
+                    root_step if am_root else None,
+                    shape=(1,), dtype=torch.float64, device=device,
+                    pg=pg, root_local=root_local,
+                ).item()
+            )
+
+        if not is_joiner:
+            # Always reshard: even with no moment state, this rekeys
+            # param_groups onto the post-reshard parameter objects.
+            _reshard_optimizer_state(
+                optimizer, storages, full_moments_all, old_param_by_fqn, new_mesh
+            )
+        else:
+            optimizer = optimizer_factory(model)
+            if has_state:
+                for storage in storages:
+                    for fqn in _bucket_fqns(storage):
+                        info = storage._param_infos[fqn]
+                        new_p = _registered_param(storage._module, fqn)
+                        new_state: dict[Any, Any] = {}
+                        for key in _CANONICAL_ADAM_MOMENT_KEYS:
+                            full = full_moments_all[fqn][key]
+                            new_state[key] = (
+                                info.placement.extract_local_shard(
+                                    full, new_rank, new_ws
+                                )
+                                .to(full.dtype)
+                                .contiguous()
+                                .clone()
+                            )
+                        # Adam's non-capturable step is a CPU float32 0-dim tensor.
+                        new_state["step"] = torch.tensor(step_value, dtype=torch.float32)
+                        optimizer.state[new_p] = new_state
+
+    # ---- Phase H: free + report ----
+    full_weights.clear()
+    bucket_full_moments.clear()
+    _cuda_sync_if_available()
+
+    resident_bytes = 0
+    for storage in storages:
+        resident_bytes = max(resident_bytes, storage._byte_storage.numel())
+
+    return new_mesh, GrowReport(
+        new_world_size=new_ws,
+        added_ranks=list(ranks_to_add),
+        is_joiner=is_joiner,
+        elapsed_seconds=time.monotonic() - start_time,
+        resident_bytes_per_rank=resident_bytes,
+        model=model if is_joiner else None,
+        optimizer=optimizer if is_joiner else None,
     )
