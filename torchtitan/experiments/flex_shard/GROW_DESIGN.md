@@ -23,7 +23,7 @@ in a new sibling entry point rather than overloading `shrink_flex_shard`.
 (Phases A–H, the `broadcast_full_tensors` primitive, `GrowReport`, joiner
 bootstrap) per this plan, with the review amendments folded in.
 
-Verified on 8x H100:
+Verified on 8x H100 — **grow is fully verified end-to-end**, same level as shrink:
 - **Grow logic — torchft-free (PASS).** 2→4 via a `dist.new_group` superset:
   survivors re-shard via `_reshard_bucket_storage`, joiners bootstrap via
   `flex_shard`+`copy_param_to_storage`. Weights bitwise-preserved
@@ -31,22 +31,20 @@ Verified on 8x H100:
   shards correct, logits invariant (`max|Δlogit| = 0`), and **post-grow training
   (reduce-scatter at ws=4) runs and converges**. Covered by
   `tests/test_elastic_grow.py`.
-- **Grow transfer — real torchft (PARTIAL).** Under `FakeManager` +
-  `ProcessGroupNCCL`, the weight/optimizer/logit transfer is bitwise-correct
-  (`max|Δ full weight| = 0`, `max|Δlogit| = 0`), and `all_reduce` / `all_gather`
-  / `reduce_scatter_tensor_coalesced` all work standalone on the grown comm.
+- **Grow e2e — real torchft `FakeManager` + `ProcessGroupNCCL` (PASS).** 2→4
+  adding joiners {2,3}: transfer bitwise-correct (`max|Δ full weight| = 0`,
+  `max|Δlogit| = 0`, cos = 1.0) AND **post-grow training at ws=4 converges**
+  (loss 0.0112→0.0025; joiner trains). The existing `FakeManager` (PG
+  reconfigure via `pg.configure`) is sufficient for grow — no extension needed.
 
-Known gap (real-torchft post-grow training):
-- The FlexShard **training** path (side-stream collectives via the bucket hooks)
-  aborts the freshly-grown `FakeManager` comm on the first training iteration
-  ("NCCL communicator was aborted" / "unhandled system error"). It does **not**
-  reproduce torchft-free, and shrink's analogous *reconfigured* comm trains
-  fine — so this is a torchft non-blocking-comm grow-lifecycle issue (survivors
-  abort the old ws=N comm + joiners create their first comm), the kind a real
-  `torchft.Manager` + Lighthouse coordinates and the `FakeManager` stub does
-  not. Tracking as M4 ("real torchft e2e grow"): retry with a real Manager
-  and/or a comm warm-up/blocking-mode handshake before the first hooked
-  training step.
+Note (corrected): an earlier draft reported a "real-torchft post-grow training"
+gap blamed on a torchft non-blocking comm-lifecycle issue. That was a **bug in
+the verification script** (one rank ran an extra `model(...)` forward — a
+collective all-gather — that the other ranks skipped, desyncing and aborting the
+grown comm), not a `FakeManager` or `grow_flex_shard` limitation. Once the
+verifier ran the forward on all ranks, grow passes end-to-end. A real
+`Manager` + Lighthouse run remains worthwhile as defense-in-depth but is not
+required to close any gap.
 
 ---
 
