@@ -42,8 +42,12 @@ Key facts that make the in-place reshard sound on this FlexShard layout:
 
 Scope (v1). Supported: ``Shard``/per-param and other gather/scatter placements
 that implement the bucket-unshard contract, single- and multi-bucket models,
-mixed precision, Adam-style optimizer state, successive shrinks (4->3->2...) and
-successive grows (:func:`grow_flex_shard`, 1->2->4...). Not supported (raises):
+mixed precision, Adam/SGD-style per-param optimizer state (any per-param state
+entry that is a tensor matching the sharded param's local shape — e.g. Adam's
+``exp_avg``/``exp_avg_sq`` or SGD's ``momentum_buffer`` — is gathered and
+re-sharded; scalars such as Adam's ``step`` carry through), successive shrinks
+(4->3->2...) and successive grows (:func:`grow_flex_shard`, 1->2->4...).
+Not supported (raises):
 ``fused=True`` / ``capturable=True`` optimizers, 2D/HSDP meshes, CPU offload
 buckets, ``torch.compile`` capture during the transition. CUDA/NCCL only
 (FlexShard core mandates a CUDA mesh).
@@ -354,22 +358,55 @@ def gather_full_tensors(
     return dict(zip(fqns, full_params, strict=True))
 
 
+# Kept only as a documentation anchor for the most common case (Adam moments).
+# The reshard logic no longer hardcodes these: see ``_shard_shaped_state_keys``.
 _CANONICAL_ADAM_MOMENT_KEYS = ("exp_avg", "exp_avg_sq")
+
+
+def _shard_shaped_state_keys(
+    storage: ShardedBucketStorage,
+    params_by_fqn: dict[str, nn.Parameter],
+    optimizer: torch.optim.Optimizer,
+) -> list[str]:
+    """Discover the per-param optimizer-state keys to gather/reshard for a bucket.
+
+    A key qualifies if, for *any* param in the bucket, its state value is a
+    ``torch.Tensor`` whose shape equals that param's *local sharded* shape (the
+    same shape as ``storage.get_local_view(fqn)``). This captures Adam's
+    ``exp_avg``/``exp_avg_sq`` and SGD's ``momentum_buffer`` alike, while
+    excluding scalars such as Adam's ``step`` (0-dim) and any non-shard-shaped
+    value. The result is returned in a deterministic ``sorted`` order.
+
+    The order/membership must be identical on every rank because the gather and
+    broadcast that consume it are collectives. Within one DP group all ranks ran
+    the same ``optimizer.step()`` calls, so the discovered key set is identical
+    across ranks; ``sorted`` pins a stable order.
+    """
+    keys: set[str] = set()
+    for fqn, param in params_by_fqn.items():
+        state = optimizer.state.get(param, {})
+        local_shape = storage.get_local_view(fqn).shape
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor) and value.shape == local_shape:
+                keys.add(key)
+    return sorted(keys)
 
 
 def _gather_full_moments_for_storage(
     storage: ShardedBucketStorage,
     optimizer: torch.optim.Optimizer | None,
 ) -> dict[str, dict[str, torch.Tensor]]:
-    """Collectively gather optimizer moment tensors for one bucket.
+    """Collectively gather per-param optimizer-state tensors for one bucket.
 
-    Returns ``{fqn: {moment_key: full_tensor}}``. Returns ``{}`` if
-    ``optimizer`` is ``None`` or no state has been populated yet.
+    Returns ``{fqn: {state_key: full_tensor}}`` for every per-param state entry
+    that is a tensor matching the sharded param's local shape (Adam's
+    ``exp_avg``/``exp_avg_sq``, SGD's ``momentum_buffer``, etc.). Returns ``{}``
+    if ``optimizer`` is ``None`` or no shard-shaped state exists yet.
 
-    Every rank must agree on which moment keys to gather (the gather is a
-    collective). We assume homogeneous Adam-style state once any state exists.
-    A param with no state yet contributes a zero-shard placeholder so the
-    batched gather is well-formed.
+    Every rank must agree on which keys to gather (the gather is a collective).
+    The key set is discovered via ``_shard_shaped_state_keys`` (deterministic,
+    identical across ranks). A param with no state for a key yet contributes a
+    zero-shard placeholder so the batched gather is well-formed.
     """
     if optimizer is None or not optimizer.state:
         return {}
@@ -381,16 +418,7 @@ def _gather_full_moments_for_storage(
     module = storage._module
     params_by_fqn = {fqn: _registered_param(module, fqn) for fqn in fqns}
 
-    present_keys: list[str] = []
-    for fqn in fqns:
-        state = optimizer.state.get(params_by_fqn[fqn], {})
-        for key in _CANONICAL_ADAM_MOMENT_KEYS:
-            if (
-                key in state
-                and isinstance(state[key], torch.Tensor)
-                and key not in present_keys
-            ):
-                present_keys.append(key)
+    present_keys = _shard_shaped_state_keys(storage, params_by_fqn, optimizer)
     if not present_keys:
         return {}
 
@@ -503,11 +531,14 @@ def _reshard_optimizer_state(
     old_param_by_fqn: dict[str, nn.Parameter],
     new_mesh: DeviceMesh,
 ) -> None:
-    """Reshape optimizer state onto post-shrink parameters.
+    """Reshape Adam/SGD-style per-param optimizer state onto post-shrink params.
 
-    - Moment tensors (``exp_avg`` / ``exp_avg_sq``) are re-sliced from the full
-      tensors gathered in Phase B via ``placement.extract_local_shard``.
-    - Scalar entries (e.g. ``step``) are copied unchanged.
+    - Shard-shaped tensors (Adam's ``exp_avg``/``exp_avg_sq``, SGD's
+      ``momentum_buffer``, etc. — every key present in ``bucket_full_moments``)
+      are re-sliced from the full tensors gathered in Phase B via
+      ``placement.extract_local_shard``.
+    - Scalar / non-shard-shaped entries (e.g. Adam's ``step``) are copied
+      unchanged.
     - ``optimizer.state`` is rekeyed from old to new Parameter objects.
     - ``param_groups[*]['params']`` is rebuilt with new refs in original order.
 
@@ -829,6 +860,72 @@ def _broadcast_one(
     return buf
 
 
+def _broadcast_state_key_names(
+    keys: list[str] | None,
+    *,
+    pg: ProcessGroup,
+    root_local: int,
+    device: torch.device,
+) -> list[str]:
+    """Broadcast the per-param state-key NAMES from the root to every rank.
+
+    During grow, only survivors hold optimizer state, so joiners cannot discover
+    which shard-shaped state keys exist. The root broadcasts the agreed key list
+    (encoded as a length-prefixed UTF-8 byte payload) so every rank gathers and
+    re-slices exactly the same keys in the same order — a hard requirement for
+    the collective broadcasts that follow.
+
+    Encoding: ``[num_keys, len(k0), len(k1), ...]`` as int64, followed by the
+    concatenated UTF-8 bytes. Two fixed-shape broadcasts (a small header carrying
+    ``num_keys``, then the variable payload) keep every rank's receive buffer
+    sized correctly without prior knowledge of the key names.
+    """
+    # Phase 1: broadcast num_keys + total payload byte count (fixed shape).
+    if keys is not None:
+        encoded = [k.encode("utf-8") for k in keys]
+        lengths = [len(b) for b in encoded]
+        payload = b"".join(encoded)
+        header_src = torch.tensor(
+            [len(keys), len(payload)], dtype=torch.int64, device=device
+        )
+    else:
+        header_src = None
+    header = _broadcast_one(
+        header_src, shape=(2,), dtype=torch.int64, device=device,
+        pg=pg, root_local=root_local,
+    )
+    num_keys = int(header[0].item())
+    payload_len = int(header[1].item())
+    if num_keys == 0:
+        return []
+
+    # Phase 2: broadcast per-key lengths + the concatenated UTF-8 payload.
+    if keys is not None:
+        meta_src = torch.tensor(lengths, dtype=torch.int64, device=device)
+        payload_src = torch.frombuffer(
+            bytearray(payload), dtype=torch.uint8
+        ).to(device)
+    else:
+        meta_src = None
+        payload_src = None
+    meta = _broadcast_one(
+        meta_src, shape=(num_keys,), dtype=torch.int64, device=device,
+        pg=pg, root_local=root_local,
+    )
+    payload_buf = _broadcast_one(
+        payload_src, shape=(payload_len,), dtype=torch.uint8, device=device,
+        pg=pg, root_local=root_local,
+    )
+    raw = bytes(payload_buf.cpu().tolist())
+    out: list[str] = []
+    offset = 0
+    for length in meta.tolist():
+        length = int(length)
+        out.append(raw[offset : offset + length].decode("utf-8"))
+        offset += length
+    return out
+
+
 def broadcast_full_tensors(
     full_by_fqn: dict[str, torch.Tensor] | None,
     infos: list[Any],
@@ -1026,35 +1123,42 @@ def grow_flex_shard(
                 )
 
     # ---- Phase G: optimizer state ----
+    #
+    # Generalized over arbitrary per-param state: the shard-shaped tensor keys
+    # (Adam's exp_avg/exp_avg_sq, SGD's momentum_buffer, ...) are gathered on
+    # the survivor root in Phase B and broadcast to every rank, then re-sliced
+    # for the new world. Adam's scalar ``step`` carries through separately. Only
+    # the root knows the optimizer state, so the agreed key set is broadcast by
+    # NAME (``_broadcast_state_key_names``) so joiners gather the same keys in
+    # the same order — the broadcasts that follow are collectives.
     use_optimizer = (optimizer is not None) or (
         is_joiner and optimizer_factory is not None
     )
     if use_optimizer:
-        # Agree on whether moment state exists (root has it iff a step ran).
-        flag_src = (
-            torch.tensor([1 if bucket_full_moments else 0], dtype=torch.int64,
-                         device=device)
-            if am_root
-            else None
+        # Root's per-param tensor-state keys, as a sorted union across buckets.
+        # ``bucket_full_moments`` already holds exactly the gathered shard-shaped
+        # keys (uniform per bucket); the union is the agreed key set.
+        root_keys: list[str] | None = None
+        if am_root:
+            seen: set[str] = set()
+            for per_key in bucket_full_moments.values():
+                seen.update(per_key.keys())
+            root_keys = sorted(seen)
+        state_keys = _broadcast_state_key_names(
+            root_keys, pg=pg, root_local=root_local, device=device
         )
-        has_state = bool(
-            int(
-                _broadcast_one(
-                    flag_src, shape=(1,), dtype=torch.int64, device=device,
-                    pg=pg, root_local=root_local,
-                ).item()
-            )
-        )
+        has_state = len(state_keys) > 0
 
         full_moments_all: dict[str, dict[str, torch.Tensor]] = {}
-        step_value = 0.0
         if has_state:
             for storage in storages:
                 infos = [storage._param_infos[fqn] for fqn in _bucket_fqns(storage)]
-                for key in _CANONICAL_ADAM_MOMENT_KEYS:
+                for key in state_keys:
                     src = (
-                        {fqn: bucket_full_moments[fqn][key]
-                         for fqn in _bucket_fqns(storage)}
+                        {
+                            fqn: bucket_full_moments[fqn][key]
+                            for fqn in _bucket_fqns(storage)
+                        }
                         if am_root
                         else None
                     )
@@ -1063,38 +1167,52 @@ def grow_flex_shard(
                     )
                     for fqn in _bucket_fqns(storage):
                         full_moments_all.setdefault(fqn, {})[key] = full_k[fqn]
-            # Broadcast a single step scalar (per-param tensor on each rank).
-            root_step = None
-            if am_root and optimizer is not None:
-                for st in optimizer.state.values():
-                    s = st.get("step")
-                    if isinstance(s, torch.Tensor):
-                        root_step = s.reshape(1).to(device=device, dtype=torch.float64)
-                        break
-            step_value = float(
-                _broadcast_one(
-                    root_step if am_root else None,
-                    shape=(1,), dtype=torch.float64, device=device,
-                    pg=pg, root_local=root_local,
-                ).item()
+
+        # Adam keeps a scalar ``step``; SGD-with-momentum has none. Agree on its
+        # presence + value via a 2-element broadcast (has_step flag, value).
+        root_step_val = None
+        if am_root and optimizer is not None:
+            for st in optimizer.state.values():
+                s = st.get("step")
+                if isinstance(s, torch.Tensor):
+                    root_step_val = float(s.item())
+                    break
+        step_src = (
+            torch.tensor(
+                [1.0 if root_step_val is not None else 0.0,
+                 root_step_val if root_step_val is not None else 0.0],
+                dtype=torch.float64, device=device,
             )
+            if am_root
+            else None
+        )
+        step_meta = _broadcast_one(
+            step_src, shape=(2,), dtype=torch.float64, device=device,
+            pg=pg, root_local=root_local,
+        )
+        has_step = bool(int(step_meta[0].item()))
+        step_value = float(step_meta[1].item())
 
         if not is_joiner:
-            # Always reshard: even with no moment state, this rekeys
+            # Always reshard: even with no tensor state, this rekeys
             # param_groups onto the post-reshard parameter objects.
             _reshard_optimizer_state(
                 optimizer, storages, full_moments_all, old_param_by_fqn, new_mesh
             )
         else:
             optimizer = optimizer_factory(model)
-            if has_state:
+            if has_state or has_step:
                 for storage in storages:
                     for fqn in _bucket_fqns(storage):
                         info = storage._param_infos[fqn]
                         new_p = _registered_param(storage._module, fqn)
                         new_state: dict[Any, Any] = {}
-                        for key in _CANONICAL_ADAM_MOMENT_KEYS:
+                        for key in state_keys:
                             full = full_moments_all[fqn][key]
+                            # Seed every shard-shaped state tensor (e.g. SGD's
+                            # momentum_buffer, which a fresh optimizer would not
+                            # create until its first step) so the joiner's first
+                            # post-grow step() matches the survivors'.
                             new_state[key] = (
                                 info.placement.extract_local_shard(
                                     full, new_rank, new_ws
@@ -1103,8 +1221,12 @@ def grow_flex_shard(
                                 .contiguous()
                                 .clone()
                             )
-                        # Adam's non-capturable step is a CPU float32 0-dim tensor.
-                        new_state["step"] = torch.tensor(step_value, dtype=torch.float32)
+                        if has_step:
+                            # Adam's non-capturable step is a CPU float32 0-dim
+                            # tensor.
+                            new_state["step"] = torch.tensor(
+                                step_value, dtype=torch.float32
+                            )
                         optimizer.state[new_p] = new_state
 
     # ---- Phase H: free + report ----

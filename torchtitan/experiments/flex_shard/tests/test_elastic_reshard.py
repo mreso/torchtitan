@@ -162,6 +162,88 @@ class TestElasticReshardNumerics(FSDPTest):
                 self.assertNotIn(old_param_by_fqn[fqn], optim.state)
 
     @skip_if_lt_x_gpu(2)
+    def test_sgd_momentum_reshard_2_to_1(self):
+        """SGD-with-momentum variant of ``test_optimizer_moment_reshard_2_to_1``.
+
+        Exercises the generalized per-param-state reshard: SGD's
+        ``momentum_buffer`` is a shard-shaped state tensor (like Adam's moments)
+        and must be gathered, re-sliced for the new world, and rekeyed — so that
+        a post-shrink ``optimizer.step()`` does not hit a stale-shape mismatch.
+        """
+        mesh = init_device_mesh(
+            device_type.type, (self.world_size,), mesh_dim_names=("fsdp",)
+        )
+        args, model = make_transformer_model(device=device_type.type)
+        _init_params_deterministically(model)
+        flex_shard(
+            model,
+            mesh,
+            buckets=transformer_bucket_specs(args.n_layers, reshard_after_forward=False),
+        )
+        optim = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+
+        # Run a few steps so momentum_buffer is populated.
+        for _ in range(3):
+            optim.zero_grad()
+            model(transformer_inputs(args, device=device_type.type)).sum().backward()
+            optim.step()
+
+        # Phase B: gather weights + state; capture old param identities.
+        storages = model.sharded_bucket_storages
+        full_weights = [elastic.gather_full_tensors(s) for s in storages]
+        bucket_full_moments = {}
+        old_param_by_fqn = {}
+        for storage in storages:
+            bucket_full_moments.update(
+                elastic._gather_full_moments_for_storage(storage, optim)
+            )
+            for fqn in storage._param_infos:
+                old_param_by_fqn[fqn] = elastic._registered_param(storage._module, fqn)
+
+        # momentum_buffer (not exp_avg/exp_avg_sq) is the gathered key.
+        any_fqn = next(iter(bucket_full_moments))
+        self.assertEqual(
+            sorted(bucket_full_moments[any_fqn].keys()), ["momentum_buffer"]
+        )
+
+        new_mesh = _survivor_mesh([0])
+        if new_mesh is None:
+            return  # departing rank
+
+        # Phase D + E on the survivor.
+        for storage, full_bucket in zip(storages, full_weights, strict=True):
+            elastic._reshard_bucket_storage(storage, full_bucket, new_mesh)
+        elastic._reshard_optimizer_state(
+            optim, storages, bucket_full_moments, old_param_by_fqn, new_mesh
+        )
+
+        # State rekeyed; ws=1 momentum_buffer equals the gathered full buffer
+        # and matches the new (resharded) local shape.
+        for storage in storages:
+            for fqn in storage._param_infos:
+                new_p = elastic._registered_param(storage._module, fqn)
+                self.assertIn(new_p, optim.state)
+                buf = optim.state[new_p]["momentum_buffer"]
+                self.assertEqual(buf.shape, storage.get_local_view(fqn).shape)
+                self.assertEqual(
+                    buf,
+                    expected_shard(
+                        bucket_full_moments[fqn]["momentum_buffer"],
+                        rank=0,
+                        world_size=1,
+                    ),
+                )
+                self.assertNotIn(old_param_by_fqn[fqn], optim.state)
+
+        # Post-shrink step() must run without a shape mismatch.
+        for _ in range(2):
+            optim.zero_grad()
+            loss = model(transformer_inputs(args, device=device_type.type)).sum()
+            loss.backward()
+            optim.step()
+            self.assertTrue(torch.isfinite(loss).item())
+
+    @skip_if_lt_x_gpu(2)
     def test_training_continues_after_reshard(self):
         mesh = init_device_mesh(
             device_type.type, (self.world_size,), mesh_dim_names=("fsdp",)
