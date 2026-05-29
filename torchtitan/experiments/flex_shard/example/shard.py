@@ -314,12 +314,24 @@ class Shard(Placement):
             # TODO: Plumb the reduction/scaling policy from SPMD gradient semantics.
             # AVG is a convenient default, but delayed grad scaling may need SUM
             # plus an explicit scale at a different point in the training step.
-            dist.reduce_scatter_tensor(
-                output=recv_buf,
-                input=send_buf,
-                op=dist.ReduceOp.AVG,
-                group=prepared.placement_state.pg,
+            #
+            # We use the ProcessGroup ``reduce_scatter_tensor_coalesced`` method
+            # (with single-element lists) rather than ``dist.reduce_scatter_tensor``.
+            # Both take one contiguous buffer (NCCL fast path), but
+            # ``dist.reduce_scatter_tensor`` dispatches to
+            # ``ProcessGroup._reduce_scatter_base``, which is NOT in PyTorch's
+            # PyProcessGroup trampoline — so a Python ProcessGroup subclass
+            # (e.g. torchft's ProcessGroupWrapper, used by elastic shrink) cannot
+            # intercept it and the call falls through to the base backend lookup
+            # ("No backend type associated with device type cuda").
+            # ``reduce_scatter_tensor_coalesced`` IS overridable, so it works on
+            # both plain NCCL groups and torchft wrappers.
+            opts = dist.ReduceScatterOptions()
+            opts.reduceOp = dist.ReduceOp.AVG
+            work = prepared.placement_state.pg.reduce_scatter_tensor_coalesced(
+                [recv_buf], [send_buf], opts
             )
+            work.wait()
         with _record_function_if_eager(
             "FlexShard::reduce_scatter_copy_out",
             prepared.placement_state.debug_fqn,

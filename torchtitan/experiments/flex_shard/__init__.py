@@ -7,6 +7,7 @@
 from .flex_shard import (
     BucketSpec,
     flex_shard,
+    gather_full_tensors,
     get_global_shape,
     get_placements,
     is_flex_shard_param,
@@ -15,12 +16,15 @@ from .flex_shard import (
     OffloadPolicy,
     Placement,
     PlacementFn,
+    ShrinkReport,
+    shrink_flex_shard,
 )
 
 
 __all__ = [
     "BucketSpec",
     "flex_shard",
+    "gather_full_tensors",
     "get_global_shape",
     "get_placements",
     "is_flex_shard_param",
@@ -29,4 +33,6 @@ __all__ = [
     "OffloadPolicy",
     "Placement",
     "PlacementFn",
+    "ShrinkReport",
+    "shrink_flex_shard",
 ]
